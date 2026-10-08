@@ -7,7 +7,11 @@ name = "video-subtitles"
 version = "0.1.0"
 description = "Extract or locally generate SRT subtitles from video files and supported URLs"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+]
 dependencies = [
     "av>=11,<19",
     "faster-whisper>=1.1.0",

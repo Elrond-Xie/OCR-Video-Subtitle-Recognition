@@ -100,3 +100,7 @@ GPU 路径每 0.5 秒采样一次。CPU 路径使用 PP-OCRv5 mobile 文本检�
 项目客户端使用 PyAV、faster-whisper（含 ONNX Runtime）、psutil、yt-dlp、CPU PaddlePaddle 和 PaddleOCR-VL。Linux 配置器还在项目 Conda 环境中提供 FFmpeg/FFprobe。GPU 推理服务使用独立的 vLLM/PyTorch 环境；CPU 推理服务使用独立的 Conda llama.cpp 环境。Linux 依赖检查命令为 `./scripts/configure`，Windows 检查命令为 `powershell -ExecutionPolicy Bypass -File scripts/configure.ps1`；修改固定依赖版本时请同步更新 [`environment/ocr-versions.env`](environment/ocr-versions.env) 和相应安装脚本。
 
 在线网站的适配、登录要求和地区限制由 yt-dlp 支持情况决定。工具不会绕过 DRM、认证或访问限制，也不会自动读取浏览器 Cookie。
+
+## 许可证
+
+本项目采用 [Apache License 2.0](LICENSE)。
