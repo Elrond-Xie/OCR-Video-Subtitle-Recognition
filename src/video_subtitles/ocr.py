@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Callable, Iterable, Protocol, Sequence
 
-from .errors import DependencyError, OCRProcessingError
+from .errors import DependencyError, MediaProcessingError, OCRProcessingError
 from .subtitles import segments_to_srt
 
 _SAMPLE_INTERVAL = 0.5
@@ -283,6 +283,8 @@ def subtitle_from_frames(
                 next_progress = float(timestamp) + 1.0
         consume(batch)
     except OCRProcessingError:
+        raise
+    except MediaProcessingError:
         raise
     except Exception as exc:
         raise OCRProcessingError(f"OCR failed while processing video frames: {exc}") from exc

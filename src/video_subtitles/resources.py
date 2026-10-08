@@ -15,8 +15,12 @@ _MAX_CPU_THREADS = 32
 _MAX_FRAME_QUEUE = 8
 _MAX_GPU_BATCH = 4
 _VL_CPU_MIN_RAM = 12 * _GIB
-_VL_GPU_MIN_RAM = 5 * _GIB
-_VL_GPU_MIN_VRAM = 8 * _GIB
+_VL_CPU_MODEL_RAM_RESERVE = 8 * _GIB
+_VL_GPU_MIN_RAM = 10 * _GIB
+_VL_GPU_MODEL_RAM_RESERVE = 5 * _GIB
+_VL_GPU_MIN_VRAM = 12 * _GIB
+_VL_GPU_MODEL_VRAM_RESERVE = 8 * _GIB
+_MIN_FRAME_BUFFER_BUDGET = 512 * _MIB
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,7 @@ def detect_system_resources() -> SystemResources:
         total_ram_bytes=max(0, total_ram),
         free_vram_bytes=free_vram,
         nvidia_device_visible=gpu_id is not None,
+        # This is the logical CUDA index after CUDA_VISIBLE_DEVICES remapping.
         nvidia_device_id=gpu_id,
     )
 
@@ -80,41 +85,40 @@ def plan_ocr_resources(
 
     cores = max(1, resources.cpu_cores)
     cpu_threads = min(_MAX_CPU_THREADS, max(1, cores - 1 if cores > 2 else cores))
-    frame_queue_size = min(
-        _MAX_FRAME_QUEUE,
-        max(0, memory_budget // (128 * _MIB)),
-    )
-
     gpu_is_usable = (
         cuda_runtime_ready
         and resources.nvidia_device_id is not None
         and resources.free_vram_bytes is not None
         and resources.free_vram_bytes >= _VL_GPU_MIN_VRAM
         and available >= _VL_GPU_MIN_RAM
+        and memory_budget - _VL_GPU_MODEL_RAM_RESERVE >= _MIN_FRAME_BUFFER_BUDGET
     )
     if gpu_is_usable:
         free_vram = resources.free_vram_bytes or 0
-        batch_size = 4 if free_vram >= 20 * _GIB else 2 if free_vram >= 12 * _GIB else 1
+        batch_vram = max(0, free_vram - _VL_GPU_MODEL_VRAM_RESERVE)
+        batch_size = 4 if batch_vram >= 16 * _GIB else 2 if batch_vram >= 8 * _GIB else 1
+        buffer_budget = memory_budget - _VL_GPU_MODEL_RAM_RESERVE
         return OCRResourcePlan(
             engine="paddle-vl",
             device="cuda",
             device_id=resources.nvidia_device_id,
             cpu_threads=min(cpu_threads, 8),
-            frame_queue_size=frame_queue_size,
+            frame_queue_size=_frame_queue_size(buffer_budget),
             batch_size=batch_size,
-            memory_budget_bytes=memory_budget,
+            memory_budget_bytes=buffer_budget,
         )
 
-    if available >= _VL_CPU_MIN_RAM and memory_budget >= 8 * _GIB:
-        batch_size = min(4, max(1, memory_budget // (3 * _GIB)))
+    cpu_buffer_budget = memory_budget - _VL_CPU_MODEL_RAM_RESERVE
+    if available >= _VL_CPU_MIN_RAM and cpu_buffer_budget >= _MIN_FRAME_BUFFER_BUDGET:
+        batch_size = min(4, max(1, cpu_buffer_budget // (3 * _GIB)))
         return OCRResourcePlan(
             engine="paddle-vl",
             device="cpu",
             device_id=None,
             cpu_threads=cpu_threads,
-            frame_queue_size=frame_queue_size,
+            frame_queue_size=_frame_queue_size(cpu_buffer_budget),
             batch_size=batch_size,
-            memory_budget_bytes=memory_budget,
+            memory_budget_bytes=cpu_buffer_budget,
         )
 
     return OCRResourcePlan(
@@ -122,7 +126,7 @@ def plan_ocr_resources(
         device="cpu",
         device_id=None,
         cpu_threads=cpu_threads,
-        frame_queue_size=frame_queue_size,
+        frame_queue_size=_frame_queue_size(memory_budget),
         batch_size=1,
         memory_budget_bytes=memory_budget,
     )
@@ -141,6 +145,10 @@ def _effective_cpu_count(physical_cores: int) -> int:
         quota_cores = max(1, (quota + period - 1) // period)
         effective = min(effective, quota_cores)
     return max(1, effective)
+
+
+def _frame_queue_size(memory_budget: int) -> int:
+    return min(_MAX_FRAME_QUEUE, max(0, memory_budget // (128 * _MIB)))
 
 
 def _cgroup_cpu_quota() -> tuple[int | None, int | None]:
@@ -177,7 +185,7 @@ def _cgroup_memory() -> tuple[int | None, int | None]:
 def _nvidia_free_memory() -> tuple[int | None, int | None]:
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,uuid,memory.free", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
             check=True,
@@ -186,13 +194,31 @@ def _nvidia_free_memory() -> tuple[int | None, int | None]:
     except (OSError, subprocess.SubprocessError):
         return None, None
 
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_tokens = [item.strip() for item in visible.split(",") if item.strip()] if visible is not None else None
+    if visible_tokens == []:
+        return None, None
     candidates: list[tuple[int, int]] = []
     for line in result.stdout.splitlines():
         fields = [field.strip() for field in line.split(",")]
-        if len(fields) != 2:
+        if len(fields) != 3:
             continue
         try:
-            candidates.append((int(fields[0]), int(float(fields[1]) * _MIB)))
+            physical_id, uuid = int(fields[0]), fields[1]
+            if visible_tokens is None:
+                logical_id = physical_id
+            else:
+                matches = [
+                    index
+                    for index, token in enumerate(visible_tokens)
+                    if token == str(physical_id)
+                    or token.casefold() == uuid.casefold()
+                    or uuid.casefold().startswith(token.casefold())
+                ]
+                if not matches:
+                    continue
+                logical_id = matches[0]
+            candidates.append((logical_id, int(float(fields[2]) * _MIB)))
         except ValueError:
             continue
     if not candidates:
