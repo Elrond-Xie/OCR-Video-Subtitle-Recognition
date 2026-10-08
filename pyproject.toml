@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-subtitles"
+version = "0.1.0"
+description = "Extract or locally generate SRT subtitles from video files and supported URLs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "av>=11,<19",
+    "faster-whisper>=1.1.0",
+    "onnxruntime>=1.17.0",
+    "psutil>=5.9,<8",
+    "rapidocr==3.9.0",
+    "yt-dlp>=2025.1.0",
+]
+
+[project.optional-dependencies]
+vl = ["paddleocr[doc-parser]==3.7.0"]
+
+[project.scripts]
+subtitles = "video_subtitles.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
