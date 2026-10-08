@@ -102,6 +102,9 @@ class PaddleOCRVLEngine:
             normalized = [_paddle_result(result) for result in output]
             for index, entries in enumerate(normalized):
                 if entries:
+                    normalized[index] = _offset_entries(
+                        entries, int(images[index].shape[0] * _LOWER_FRAME_RATIO)
+                    )
                     continue
                 # The crop may omit unusually positioned captions. Use the full frame once.
                 normalized[index] = _paddle_result(self._predict([images[index]])[0])
@@ -374,6 +377,17 @@ def _subtitle_crop(image: Any) -> Any:
     return image[top:, :]
 
 
+def _offset_entries(entries: list[OCRText], vertical_offset: int) -> list[OCRText]:
+    return [
+        OCRText(
+            entry.text,
+            tuple((x, y + vertical_offset) for x, y in entry.box) if entry.box is not None else None,
+            entry.confidence,
+        )
+        for entry in entries
+    ]
+
+
 def _usable(entries: list[OCRText], image: Any) -> bool:
     return bool(_caption_from_entries(entries, image))
 
@@ -393,10 +407,6 @@ def _caption_from_entries(entries: list[OCRText], image: Any) -> str | None:
             left = min(point[0] for point in entry.box)
         except (TypeError, ValueError, IndexError):
             continue
-        # Paddle boxes are relative to the lower crop; RapidOCR boxes are full-frame.
-        if top < height * _LOWER_FRAME_RATIO and bottom <= height * (1 - _LOWER_FRAME_RATIO) + 1:
-            top += height * _LOWER_FRAME_RATIO
-            bottom += height * _LOWER_FRAME_RATIO
         if (top + bottom) / 2 < height * _LOWER_FRAME_RATIO:
             continue
         lines.append((top, left, cleaned))
