@@ -16,7 +16,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="subtitles",
         description="Extract existing subtitles, read on-screen captions with OCR, or transcribe audio locally.",
     )
-    parser.add_argument("input", help="local media path or supported online video URL")
+    parser.add_argument("input", nargs="?", help="local media path or supported online video URL")
+    parser.add_argument(
+        "--input",
+        dest="input_option",
+        help="local media path or supported online video URL (named form)",
+    )
     parser.add_argument("-o", "--output", type=Path, help="output SRT path (default: same base name)")
     parser.add_argument("--cookies", type=Path, help="optional yt-dlp cookies file for authenticated pages")
     parser.add_argument(
@@ -37,6 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.input is not None and args.input_option is not None:
+        parser.error("provide the input once, either positionally or with --input")
+    input_value = args.input_option or args.input
+    if not input_value:
+        parser.error("an input path or URL is required; pass it as --input PATH_OR_URL")
     progress_started = False
     progress_started_at = 0.0
 
@@ -99,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         result = create_subtitles(
-            input_value=args.input,
+            input_value=input_value,
             output=args.output,
             cookies=args.cookies,
             model_size=args.model,
