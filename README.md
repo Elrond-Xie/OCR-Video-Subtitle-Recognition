@@ -34,7 +34,7 @@ Linux 的 `./scripts/configure` 默认只检查环境，不安装软件。检测
 Windows PowerShell 使用独立 Python 虚拟环境，GPU 安装失败时同样创建全新的 CPU 环境：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/setup.ps1
+powershell -ExecutionPolicy Bypass -File scripts/configure.ps1
 ```
 
 脚本不会修改系统 Python 或 shell 启动文件。Linux 环境把 FFmpeg 一并装入 micromamba；Windows 需要自行安装 FFmpeg 并加入 `PATH`。首次 GPU setup 会检查并初始化 PaddleOCR-VL，可能下载模型文件。Linux 和 Windows 都使用清单中固定的 Paddle/PaddleOCR 版本和 NVIDIA CUDA 12.6 运行时；CUDA 依赖由 Paddle wheel 提供，仍需兼容的 NVIDIA 驱动。若 GPU 不可用，就使用 CPU PaddleOCR 与 RapidOCR。
