@@ -1,0 +1,6 @@
+# GPU memory/context settings. scripts/vlm-server.sh derives max-num-seqs from
+# effective logical CPU threads, available RAM, GPU memory, and model KV-cache size.
+gpu-memory-utilization: 0.78
+max-model-len: 8192
+max-num-batched-tokens: 32768
+max-num-seqs: 1

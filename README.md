@@ -1,142 +1,102 @@
 # Video Subtitles
 
-跨平台命令行工具：输入本地视频或 yt-dlp 支持的在线视频页面，优先提取已有对白字幕；没有可用字幕时，在本机运行语音识别并生成 SRT。
+跨平台命令行工具：从本地视频或受支持的在线视频中提取现有字幕；也可以识别画面中的烧录字幕，或在本机将语音转写为 SRT。
 
 ## 功能
 
-- 支持 Windows、macOS、Linux。
-- 支持本地视频文件和 yt-dlp 支持的在线页面，包括哔哩哔哩。
-- 优先提取已有字幕；忽略 B 站弹幕。
-- 使用 `--ocr` 时，优先识别烧录在画面中的字幕；识别不到时回退到本地 Whisper。
-- 找不到可用字幕时，使用本机 faster-whisper 多语言模型转写，并自动识别原语言。
-- 在线视频可通过 `--cookies` 显式提供登录 Cookie 文件。
-- 生成 `.srt` 文件。已有输出文件默认不会被覆盖，需显式使用 `--force`。
+- 使用 FFmpeg/FFprobe 检查媒体并提取字幕、音轨或视频帧。
+- 在线媒体由 yt-dlp 读取；Cookie 仅在显式传入 `--cookies` 时使用。
+- `--ocr` 识别烧录字幕。OCR 使用 PaddleOCR-VL：NVIDIA GPU 通过 vLLM 推理，CPU 通过 llama.cpp 推理。
+- 没有可用字幕或 OCR 结果时，使用本地 faster-whisper 转写。默认 OCR 服务也在本机运行；如果通过 `--ocr-server-url` 指定远程服务，视频帧会发送到该服务。
+- 默认不覆盖已有 SRT；需要覆盖时使用 `--force`。
 
-## 安装
+## Linux / WSL 安装
 
-Linux x86_64 推荐使用下面的 `configure`，它会在项目环境中安装 Python 和 FFmpeg，无须预装到系统。Windows 配置脚本需要 Python 3.11 x64（通过 `py.exe`）以及加入 `PATH` 的 FFmpeg/FFprobe。手动安装和 macOS 需要 Python 3.10 或更新版本及 FFmpeg；下载方式见[官方页面](https://ffmpeg.org/download.html)。
-
-### 自适应 OCR 环境（推荐）
-
-Linux 的 `./scripts/configure` 默认只检查环境，不安装软件。检测依赖时会根据当前 TTY 和终端能力显示颜色。只有缺少系统级下载或校验工具时才会用 `sudo` 安装它们；micromamba、Python 环境、FFmpeg 和 OCR 包都安装在项目目录，不需要管理员权限。
+推荐在 Linux x86_64 或 WSL 工程目录中运行配置器。Miniforge、Python、FFmpeg 和 Python 包安装在项目目录，不需要 Docker；系统只需提供下载工具和 SHA-256 校验工具。
 
 ```bash
-./scripts/configure
-./scripts/configure --setup
+./scripts/configure                 # 检查依赖
+./scripts/configure --setup         # 安装客户端环境
 ```
 
-`--setup` 会检查 NVIDIA GPU 并尝试配置 CUDA；GPU 环境安装、运行时检查或 PaddleOCR-VL 初始化失败时，会清理该环境并新建 CPU 环境。添加 `--yes` 可跳过安装确认；如果自动安装缺少的系统工具需要 sudo，脚本使用非交互 sudo，要求当前 sudo 凭证已可用：
+安装会创建 `.envs/ocr-client`，其中包括 ASR/媒体处理包、CPU PaddleOCR-VL 客户端和轻量字幕候选检测器。Miniforge 位于 `.tools/`，包与模型缓存位于 `downloads/`。固定版本和缓存路径见 [`environment/ocr-versions.env`](environment/ocr-versions.env)。
+
+### NVIDIA GPU 推理
+
+在可通过 `nvidia-smi` 访问 NVIDIA GPU 的 Linux/WSL 环境中安装并启动项目内 vLLM 服务：
 
 ```bash
-./scripts/configure --setup --yes
+./scripts/setup-vlm-server.sh
+./scripts/vlm-server.sh start
+./scripts/vlm-server.sh status
 ```
 
-Windows PowerShell 使用独立 Python 虚拟环境，GPU 安装失败时同样创建全新的 CPU 环境：
+服务环境在 `.envs/ocr-vlm-server`，日志在 `logs/vlm-server/`。首次启动会下载 PaddleOCR-VL 模型。处理完成后可运行 `./scripts/vlm-server.sh stop`。
+
+### CPU 推理
+
+CPU 服务使用项目内独立的 llama.cpp 环境和 PaddleOCR-VL GGUF 模型：
+
+```bash
+./scripts/setup-llama-server.sh
+./scripts/llama-server.sh start
+./scripts/llama-server.sh status
+```
+
+模型保存在 `downloads/paddleocr-vl-gguf/`，下载后会校验 SHA-256。服务日志在 `logs/llama-server/`；处理完成后运行 `./scripts/llama-server.sh stop`。
+
+GPU 和 CPU 服务安装脚本目前面向 Linux x86_64/WSL。检测到 NVIDIA GPU 时，`--ocr-backend auto` 选择 vLLM；否则选择 llama.cpp。也可以用 `--ocr-backend vllm` 或 `--ocr-backend llama-cpp` 显式选择服务。服务不可用时程序会报错，不会静默切换推理后端。
+
+## Windows 与 macOS
+
+Windows PowerShell 客户端需要 Python 3.11 x64（通过 `py.exe`）以及在 `PATH` 中可用的 FFmpeg/FFprobe：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/configure.ps1
+powershell -ExecutionPolicy Bypass -File scripts/configure.ps1 --setup
+powershell -ExecutionPolicy Bypass -File scripts/run.ps1 --input .\video.mp4 --ocr --ocr-server-url http://127.0.0.1:8111/v1
 ```
 
-脚本不会修改系统 Python 或 shell 启动文件。Linux 环境把 FFmpeg 一并装入 micromamba；Windows 需要自行安装 FFmpeg 并加入 `PATH`。首次 GPU setup 会检查并初始化 PaddleOCR-VL，可能下载模型文件。Linux 和 Windows 都使用清单中固定的 Paddle/PaddleOCR 版本和 NVIDIA CUDA 12.6 运行时；CUDA 依赖由 Paddle wheel 提供，仍需兼容的 NVIDIA 驱动。若 GPU 不可用，就使用 CPU PaddleOCR 与 RapidOCR。
-
-程序根据有效 CPU 数、可用内存、容器限制和 NVIDIA 显存选择 PaddleOCR-VL 或 RapidOCR，并限制 CPU 线程、预取帧和推理批量。运行时会报告所选模型和设备；VL 无法初始化或推理时会回退到 RapidOCR。PaddleOCR-VL 的文档解析能力不代表它在所有视频字幕、字体或画面条件下都更准确；当前没有项目字幕样本基准，最终效果仍受视频质量和语言影响。
-
-macOS 本轮暂不安装 PaddleOCR-VL，继续使用现有 Python 安装流程中的 RapidOCR CPU 路径。
-
-### 手动 Python 环境
-
-如需手动管理环境，在项目目录运行：
-
-```bash
-python -m venv .venv
-```
-
-Linux/macOS 激活虚拟环境：
-
-```bash
-source .venv/bin/activate
-```
-
-Windows PowerShell 激活虚拟环境：
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-安装命令行工具：
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
+OCR 推理服务仍需在 Linux/WSL 中单独安装和启动：CPU llama.cpp 默认端口是 `8111`，GPU vLLM 默认端口是 `8118`。macOS 可安装 Python 环境并使用 CLI；本项目没有提供 macOS 本地 OCR 服务安装脚本，可用 `--ocr-server-url` 连接兼容的服务。
 
 ## 使用
 
-提取本地视频字幕；如果没有可用字幕轨，会自动在本机转写：
+提取已有字幕或在需要时进行本地语音转写：
 
 ```bash
 subtitles ./video.mp4
-```
-
-处理在线视频页面：
-
-```bash
 subtitles "https://www.bilibili.com/video/BV..."
 ```
 
-指定输出位置：
+识别画面中的烧录字幕：
 
 ```bash
-subtitles ./video.mp4 --output ./captions.srt
+./scripts/run.sh --input ./video.mp4 --ocr
+./scripts/run.sh --input "https://www.bilibili.com/video/BV..." --cookies ./cookies.txt --ocr
 ```
 
-覆盖已存在的输出文件：
+指定输出位置、覆盖已有文件或限制 OCR 并发：
 
 ```bash
 subtitles ./video.mp4 --output ./captions.srt --force
+subtitles ./video.mp4 --ocr --ocr-concurrency 2
 ```
 
-为需要登录的页面显式传入 Cookie 文件：
+完整选项可通过 `subtitles --help` 查看。ASR 默认使用 `small` 模型，也可以通过 `--model` 选择 `tiny`、`base`、`medium`、`large-v3` 或 `large-v3-turbo`。模型首次使用时会下载到本地缓存。
 
-```bash
-subtitles "https://www.bilibili.com/video/BV..." --cookies ./cookies.txt
-```
+## OCR 采样与资源使用
 
-通过 Linux `run.sh` 使用命名参数识别本地视频或在线视频画面中烧录的字幕：
+GPU 路径每 0.5 秒采样一次。CPU 路径使用 PP-OCRv5 mobile 文本检测器每 0.2 秒扫描字幕区域，并在发现候选字幕、字幕版式变化或稳定字幕复查时调用 llama.cpp；候选检测器不可用时回退到 0.5 秒识别间隔。客户端根据当前机器资源和实测帧吞吐调整并发，`--ocr-concurrency` 可限制并发上限。CPU VLM 单帧推理仍可能较慢；CPU 全片识别的速度和准确率尚未完成充分验证。
 
-```bash
-scripts/run.sh --input ./video.mp4 --ocr
-scripts/run.sh --input "https://www.bilibili.com/video/BV..." --ocr
-scripts/run.sh --input "https://www.bilibili.com/video/BV..." --cookies ./cookies.txt --ocr
-```
+## 输出、日志和清理
 
-Windows PowerShell 使用相同的 `--input` 参数，既支持本地路径，也支持在线视频 URL：
+- 默认 SRT 输出到本地视频旁边，在线视频输出到当前目录；使用 `--output` 可指定路径。
+- 中间媒体和服务临时文件放在项目 `output/` 中，任务结束后会清理。
+- 配置和运行日志放在 `logs/`；包、模型和下载缓存放在 `downloads/`。
+- `./scripts/configure --clean` 清理运行缓存和生成字幕；`./scripts/configure --distclean` 还会删除项目管理的下载缓存和本地环境。清理前会要求确认，可加 `--yes` 跳过确认。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/run.ps1 --input .\video.mp4 --ocr
-powershell -ExecutionPolicy Bypass -File scripts/run.ps1 --input "https://www.bilibili.com/video/BV..." --cookies .\cookies.txt --ocr
-```
+## 依赖概览
 
-OCR 大约每 0.5 秒识别一帧并估算字幕时间，终端会显示实时进度条；能获取视频总时长时显示百分比和当前时间，时长未知时显示已处理时间。自适应环境会优先在高资源机器上运行 PaddleOCR-VL；弱机器、VL 初始化或推理失败时使用 RapidOCR CPU。手动安装环境仍可通过 `pip install -e .` 使用 RapidOCR CPU。OCR 会解码采样点之间的视频帧，因此处理速度取决于视频分辨率和编解码器，可能慢于视频播放速度。时间精度和文字准确度会受视频帧率、字幕样式、位置与对比度影响。在线视频 OCR 需要 yt-dlp 获取视频画面；程序优先尝试流式读取，不兼容时会使用并清理临时视频文件。如果 yt-dlp 仍无法获取视频，先通过你可用的方式保存视频，再把本地文件交给命令处理。`--ocr` 模式不会退回可能不匹配的下载字幕轨。
+项目客户端依赖 PyAV、faster-whisper、ONNX Runtime、psutil、yt-dlp、CPU PaddlePaddle 和 PaddleOCR-VL。Linux 配置器还在项目 Conda 环境中提供 FFmpeg/FFprobe。GPU 推理服务使用独立的 vLLM/PyTorch 环境；CPU 推理服务使用独立的 Conda llama.cpp 环境。依赖检查命令为 `./scripts/configure`；修改依赖版本时请同步更新 `environment/ocr-versions.env` 和安装脚本。
 
-选择 ASR 模型（默认 `small`；仅无可用字幕或 OCR 未识别到画面字幕时才会加载）：
-
-```bash
-subtitles ./video.mp4 --model base
-```
-
-支持的模型名：`tiny`、`base`、`small`、`medium`、`large-v3`、`large-v3-turbo`。首次执行 ASR 时需要下载模型文件并缓存在本机；视频音频不会上传。CPU 速度和可用内存会影响转写耗时，可用较小模型降低资源需求。
-
-## 输出位置
-
-- 本地文件：同目录、同主文件名的 `.srt`。
-- 在线页面：当前工作目录下以视频标题命名的 `.srt`；无法获取标题时使用稳定的回退名称。
-- `--output` 可以指定完整输出路径。
-- 工具使用临时目录处理媒体，并在任务结束后清理临时文件。
-
-## 限制
-
-- 在线页面支持情况取决于 yt-dlp 的站点适配；平台变化、登录要求、地区限制和视频权限可能影响提取。
-- 登录页面必须由用户显式传入 Cookie 文件。工具不绕过 DRM 或平台访问限制，也不会直接读取浏览器配置。
-- 当前 OCR 只识别画面下方持续出现的字幕文本，不包含字幕翻译、批量队列或图形界面。
-- 部分图像字幕轨（例如 PGS）不能直接转成文本；这类文件会尝试回退到音频转写。
+在线网站的适配、登录要求和地区限制由 yt-dlp 支持情况决定。工具不会绕过 DRM、认证或访问限制，也不会自动读取浏览器 Cookie。

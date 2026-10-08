@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from .errors import DependencyError, MediaProcessingError, OnlineExtractionError
 from .media import iter_video_frames
-from .ocr import FrameOCR, create_ocr_engine, subtitle_from_frames
+from .ocr import FrameOCR, create_ocr_runtime, subtitle_from_frames
 from .subtitles import subtitle_file_to_srt
 
 _SUBTITLE_SUFFIXES = {".srt", ".vtt", ".json", ".json3", ".bcc", ".ttml", ".dfxp", ".xml"}
@@ -24,17 +26,21 @@ def _youtube_dl():
 
 
 def _options(cookies: Path | None = None) -> dict[str, Any]:
-    options: dict[str, Any] = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    # Keep yt-dlp's native download progress visible on the terminal and in the
+    # runtime log. Its renderer detects whether the original stream is a TTY.
+    options: dict[str, Any] = {"quiet": False, "no_warnings": True, "noplaylist": True}
     if cookies is not None:
         options["cookiefile"] = str(cookies)
     return options
 
 
-def _extract_info(url: str, cookies: Path | None) -> dict[str, Any]:
+def _extract_info(url: str, cookies: Path | None, on_long_operation=None) -> dict[str, Any]:
     yt_dlp = _youtube_dl()
     try:
-        with yt_dlp.YoutubeDL(_options(cookies)) as downloader:
-            info = downloader.extract_info(url, download=False)
+        wait = on_long_operation("Reading online video information") if on_long_operation else nullcontext()
+        with wait:
+            with yt_dlp.YoutubeDL(_options(cookies)) as downloader:
+                info = downloader.extract_info(url, download=False)
     except Exception as exc:
         raise OnlineExtractionError(
             f"Could not read this URL. Check that the site is supported and the video is accessible: {exc}"
@@ -67,9 +73,11 @@ def _subtitle_choice(info: dict[str, Any]) -> tuple[str, bool] | None:
     return None
 
 
-def available_subtitle(url: str, workdir: Path, cookies: Path | None) -> tuple[str, str] | None:
+def available_subtitle(
+    url: str, workdir: Path, cookies: Path | None, on_long_operation=None
+) -> tuple[str, str] | None:
     """Return (title, normalized SRT) when a non-danmaku subtitle track exists."""
-    info = _extract_info(url, cookies)
+    info = _extract_info(url, cookies, on_long_operation)
     choice = _subtitle_choice(info)
     if choice is None:
         # Some extractors (including Bilibili) expose subtitles only during the
@@ -128,9 +136,11 @@ def available_subtitle(url: str, workdir: Path, cookies: Path | None) -> tuple[s
     return None
 
 
-def download_audio(url: str, workdir: Path, cookies: Path | None) -> tuple[str, Path]:
+def download_audio(
+    url: str, workdir: Path, cookies: Path | None, on_long_operation=None
+) -> tuple[str, Path]:
     yt_dlp = _youtube_dl()
-    info = _extract_info(url, cookies)
+    info = _extract_info(url, cookies, on_long_operation)
     options = _options(cookies)
     options.update(
         {
@@ -162,10 +172,11 @@ def extract_online_ocr(
     engine: FrameOCR | None = None,
     batch_size: int = 1,
     prefetch: int = 0,
+    on_long_operation=None,
 ) -> tuple[str, str | None]:
     """Try decoding a yt-dlp stdout stream, then retry from a temporary video file."""
     try:
-        info = _extract_info(url, cookies)
+        info = _extract_info(url, cookies, on_long_operation)
     except OnlineExtractionError as exc:
         raise OnlineExtractionError(
             f"Could not retrieve video frames for OCR. If the page plays in your browser, save the video locally and run subtitles on that file: {exc}"
@@ -173,23 +184,41 @@ def extract_online_ocr(
     title = str(info.get("title") or info.get("id") or "video")
     duration = info.get("duration")
     duration = float(duration) if isinstance(duration, (int, float)) and duration > 0 else None
-    engine = engine or create_ocr_engine(on_model_load=on_model_load)
+    if engine is None:
+        engine, planned = create_ocr_runtime(on_model_load=on_model_load)
+        batch_size = planned.batch_size
+        prefetch = planned.frame_queue_size
 
     try:
         process = subprocess.Popen(
             _stream_command(url, cookies),
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
     except OSError:
         video_path = _download_video_for_ocr(url, workdir, cookies)
         return title, _ocr_downloaded_video(video_path, engine, duration, on_progress, batch_size, prefetch)
     stream_decoded = False
     stream_result: str | None = None
+    stderr_thread = None
+    if process.stderr is not None:
+        def forward_stderr() -> None:
+            while True:
+                chunk = process.stderr.read1(4096)
+                if not chunk:
+                    break
+                print(chunk.decode("utf-8", errors="replace"), end="", file=sys.stderr, flush=True)
+
+        stderr_thread = threading.Thread(target=forward_stderr, name="yt-dlp-output", daemon=True)
+        stderr_thread.start()
     try:
         if process.stdout is not None:
             stream_result = subtitle_from_frames(
-                iter_video_frames(process.stdout, prefetch=prefetch),
+                iter_video_frames(
+                    process.stdout,
+                    sample_interval=getattr(engine, "frame_scan_interval", 0.5),
+                    prefetch=prefetch,
+                ),
                 engine,
                 duration=duration,
                 on_progress=on_progress,
@@ -208,6 +237,10 @@ def extract_online_ocr(
                 process.wait()
         if process.stdout is not None:
             process.stdout.close()
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1)
+        if process.stderr is not None:
+            process.stderr.close()
 
     if stream_decoded:
         return title, stream_result
@@ -226,7 +259,11 @@ def _ocr_downloaded_video(
 ) -> str | None:
     try:
         return subtitle_from_frames(
-            iter_video_frames(video_path, prefetch=prefetch),
+            iter_video_frames(
+                video_path,
+                sample_interval=getattr(engine, "frame_scan_interval", 0.5),
+                prefetch=prefetch,
+            ),
             engine,
             duration=duration,
             on_progress=on_progress,
@@ -243,10 +280,9 @@ def _stream_command(url: str, cookies: Path | None) -> list[str]:
         sys.executable,
         "-m",
         "yt_dlp",
-        "--quiet",
         "--no-warnings",
-        "--no-progress",
         "--no-playlist",
+        "--progress",
         "--format",
         "best",
         "--output",

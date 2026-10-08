@@ -2,19 +2,33 @@
 
 from __future__ import annotations
 
-import os
 import re
+import shutil
+import subprocess
 import sys
+import time
+import warnings
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Callable, Iterable, Protocol, Sequence
 
 from .errors import DependencyError, MediaProcessingError, OCRProcessingError
 from .subtitles import segments_to_srt
+from .throughput import OCRBatchController, log_batch_observation
 
 _SAMPLE_INTERVAL = 0.5
-_MIN_CONFIDENCE = 0.50
 _LOWER_FRAME_RATIO = 0.55
+_PADDLE_SUBTITLE_CROP_RATIO = 0.75
+_PADDLE_MAX_NEW_TOKENS = 128
+_PADDLE_MAX_PIXELS = 131072
+# Keep CPU and GPU VLM requests at a comparable input resolution. The CPU
+# llama.cpp OCR prompt does not use PaddleX's spotting-only 2x image upscale.
+_PADDLE_CPU_MAX_PIXELS = _PADDLE_MAX_PIXELS
+_PADDLE_TENSOR_COPY_WARNING = (
+    r"To copy construct from a tensor, it is recommended to use "
+    r"sourceTensor\.clone\(\)\.detach\(\), rather than "
+    r"paddle\.to_tensor\(sourceTensor\)\."
+)
 _MERGE_SIMILARITY = 0.90
 _MAX_MERGE_GAP = 1.0
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
@@ -27,6 +41,79 @@ class OCRText:
     confidence: float | None
 
 
+class CPUFrameSampler:
+    """Reduce repeated CPU VLM calls while confirming newly visible text."""
+
+    def __init__(
+        self,
+        confirmation_interval: float = 0.2,
+        active_interval: float = 1.0,
+        fallback_interval: float = 0.5,
+    ) -> None:
+        self.confirmation_interval = confirmation_interval
+        self.active_interval = active_interval
+        self.fallback_interval = fallback_interval
+        self.last_processed: float | None = None
+        self.candidate_started: float | None = None
+        self.candidate_confirmed = False
+        self.previous_candidate = False
+        self.last_signature: tuple[tuple[int, int, int], ...] | None = None
+
+    def should_process(
+        self,
+        timestamp: float,
+        has_text: bool,
+        signature: tuple[tuple[int, int, int], ...] | None = None,
+        use_fallback: bool = True,
+    ) -> bool:
+        if has_text:
+            if not self.previous_candidate:
+                self.candidate_started = timestamp
+                self.candidate_confirmed = False
+                self.previous_candidate = True
+                return self._selected(timestamp, signature)
+            if (
+                signature is not None
+                and self.last_signature is not None
+                and _caption_layout_changed(self.last_signature, signature)
+                and self.last_processed is not None
+                and timestamp - self.last_processed >= self.confirmation_interval
+            ):
+                self.candidate_confirmed = True
+                return self._selected(timestamp, signature)
+            if (
+                not self.candidate_confirmed
+                and self.candidate_started is not None
+                and timestamp - self.candidate_started >= self.confirmation_interval
+            ):
+                self.candidate_confirmed = True
+                return self._selected(timestamp, signature)
+            if self.last_processed is None or timestamp - self.last_processed >= self.active_interval:
+                self.candidate_confirmed = True
+                return self._selected(timestamp, signature)
+            return False
+
+        self.previous_candidate = False
+        self.candidate_started = None
+        self.candidate_confirmed = False
+        self.last_signature = None
+        if use_fallback and (
+            self.last_processed is None
+            or timestamp - self.last_processed >= self.fallback_interval
+        ):
+            return self._selected(timestamp, None)
+        return False
+
+    def _selected(
+        self,
+        timestamp: float,
+        signature: tuple[tuple[int, int, int], ...] | None,
+    ) -> bool:
+        self.last_processed = timestamp
+        self.last_signature = signature
+        return True
+
+
 class FrameOCR(Protocol):
     engine_name: str
     device_name: str
@@ -36,78 +123,120 @@ class FrameOCR(Protocol):
     def close(self) -> None: ...
 
 
-class RapidOCREngine:
-    engine_name = "RapidOCR"
-    device_name = "CPU"
-
-    def __init__(self, cpu_threads: int) -> None:
-        try:
-            from rapidocr import RapidOCR
-        except ImportError as exc:
-            raise DependencyError("RapidOCR is missing. Run the platform setup script to install OCR dependencies.") from exc
-        try:
-            self._engine = RapidOCR(
-                params={
-                    "EngineConfig.onnxruntime.intra_op_num_threads": max(1, cpu_threads),
-                    "EngineConfig.onnxruntime.inter_op_num_threads": 1,
-                }
-            )
-        except Exception as exc:
-            raise OCRProcessingError(f"Could not initialize RapidOCR: {exc}") from exc
-
-    def recognize_batch(self, images: Sequence[Any]) -> list[list[OCRText]]:
-        results = []
-        for image in images:
-            try:
-                result = self._engine(image)
-            except Exception as exc:
-                raise OCRProcessingError(f"RapidOCR failed while processing a video frame: {exc}") from exc
-            if isinstance(result, tuple):
-                result = result[0]
-            results.append(_rapid_result(result))
-        return results
-
-    def close(self) -> None:
-        self._engine = None
-
-
 class PaddleOCRVLEngine:
     engine_name = "PaddleOCR-VL"
 
-    def __init__(self, device: str, cpu_threads: int, batch_size: int) -> None:
-        self.device_name = "CUDA" if device.startswith("gpu:") or device == "cuda" else "CPU"
+    def __init__(
+        self,
+        cpu_threads: int,
+        batch_size: int,
+        backend: str = "vllm",
+        server_url: str | None = None,
+        concurrency: int = 1,
+    ) -> None:
+        self.backend = backend
+        self.device_name = f"{backend} service"
         try:
             from paddleocr import PaddleOCRVL
         except ImportError as exc:
             raise DependencyError("PaddleOCR-VL is missing. Run the platform setup script to install the VL runtime.") from exc
-        if device.startswith("gpu:"):
-            paddle_device = device
-        elif device == "cuda":
-            paddle_device = "gpu:0"
-        else:
-            paddle_device = "cpu"
-        kwargs: dict[str, Any] = {"device": paddle_device}
-        if device == "cpu":
-            kwargs["cpu_threads"] = max(1, cpu_threads)
+        kwargs: dict[str, Any] = {
+            "device": "cpu",
+            # Subtitle crops need OCR only; document layout detection adds an
+            # unnecessary model pass and can split one caption into many calls.
+            "use_layout_detection": False,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_queues": True,
+        }
+        kwargs["cpu_threads"] = max(1, cpu_threads)
+        paddle_backend = {"vllm": "vllm-server", "llama-cpp": "llama-cpp-server"}[backend]
+        kwargs.update(vl_rec_backend=paddle_backend, vl_rec_max_concurrency=max(1, concurrency))
+        if server_url:
+            kwargs["vl_rec_server_url"] = server_url
         try:
             self._engine = PaddleOCRVL(**kwargs)
         except Exception as exc:
             raise OCRProcessingError(f"Could not initialize PaddleOCR-VL: {exc}") from exc
+        self._candidate_detector = None
+        self._frame_sampler = CPUFrameSampler()
+        self.frame_scan_interval = 0.5
+        if backend == "llama-cpp":
+            self.frame_scan_interval = 0.2
+            try:
+                from paddleocr import TextDetection
+
+                self._candidate_detector = TextDetection(
+                    model_name="PP-OCRv5_mobile_det",
+                    device="cpu",
+                    limit_side_len=640,
+                    limit_type="max",
+                    thresh=0.3,
+                    box_thresh=0.5,
+                    enable_mkldnn=False,
+                )
+            except Exception as exc:
+                self.frame_scan_interval = 0.5
+                print(
+                    f"[WARN] Lightweight CPU text detection is unavailable; using the safe 0.5s OCR cadence: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         self.batch_size = max(1, batch_size)
+
+    def should_process_frame(self, timestamp: float, image: Any) -> bool:
+        detector = self._candidate_detector
+        if detector is None:
+            return self._frame_sampler.should_process(
+                timestamp, has_text=False, use_fallback=True
+            )
+        try:
+            crop = _subtitle_crop(image)
+            result = next(detector.predict_iter([crop]))
+            value = getattr(result, "json", None)
+            if callable(value):
+                value = value()
+            payload = value.get("res", value) if isinstance(value, dict) else {}
+            polygons = payload.get("dt_polys", []) if isinstance(payload, dict) else []
+            signature = _caption_layout_signature(polygons, crop.shape[1], crop.shape[0])
+            has_text = bool(signature)
+        except Exception as exc:
+            print(
+                f"[WARN] Lightweight CPU text detection failed; retaining the frame for OCR: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._candidate_detector = None
+            has_text = False
+            signature = None
+            use_fallback = True
+        else:
+            use_fallback = False
+        return self._frame_sampler.should_process(
+            timestamp, has_text, signature, use_fallback=use_fallback
+        )
 
     def recognize_batch(self, images: Sequence[Any]) -> list[list[OCRText]]:
         try:
             crops = [_subtitle_crop(image) for image in images]
-            output = self._predict(crops)
-            normalized = [_paddle_result(result) for result in output]
+            prepared_crops = crops
+            crop_scales: list[tuple[float, float]] | None = None
+            if self.backend == "llama-cpp":
+                prepared_crops, crop_scales = _resize_images_to_pixel_limit(
+                    crops, _PADDLE_CPU_MAX_PIXELS
+                )
+            output = self._predict(prepared_crops)
+            normalized = [
+                _paddle_result(result, allow_full_crop=self.backend == "llama-cpp")
+                for result in output
+            ]
             for index, entries in enumerate(normalized):
                 if entries:
+                    if crop_scales is not None:
+                        entries = _scale_entries(entries, *crop_scales[index])
                     normalized[index] = _offset_entries(
-                        entries, int(images[index].shape[0] * _LOWER_FRAME_RATIO)
+                        entries, int(images[index].shape[0] * _PADDLE_SUBTITLE_CROP_RATIO)
                     )
-                    continue
-                # The crop may omit unusually positioned captions. Use the full frame once.
-                normalized[index] = _paddle_result(self._predict([images[index]])[0])
             return normalized
         except Exception as exc:
             if isinstance(exc, OCRProcessingError):
@@ -117,9 +246,35 @@ class PaddleOCRVLEngine:
     def _predict(self, images: Sequence[Any]) -> list[Any]:
         output: list[Any] = []
         # PaddleOCR-VL exposes predict_iter for streamed, memory-bounded inference.
-        iterator = self._engine.predict_iter(list(images))
-        for result in iterator:
-            output.append(result)
+        with warnings.catch_warnings():
+            # PaddleX 3.7 wraps an existing Paddle tensor with paddle.to_tensor;
+            # its copy-construction warning is harmless and originates upstream.
+            warnings.filterwarnings(
+                "ignore",
+                message=_PADDLE_TENSOR_COPY_WARNING,
+                category=UserWarning,
+                module=r"paddle\.tensor\.creation",
+            )
+            if self.backend == "llama-cpp":
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"'llama-cpp-server' does not support `(?:min|max)_pixels`\.",
+                    category=UserWarning,
+                    module=r"paddlex\.inference\.models\.doc_vlm\.predictor",
+                )
+            prediction_options = {
+                # Spotting returns text with localized polygons. Plain OCR returns
+                # one full-crop box, which cannot distinguish subtitles from
+                # hallucinated/background text.
+                "prompt_label": "ocr" if self.backend == "llama-cpp" else "spotting",
+                "max_new_tokens": _PADDLE_MAX_NEW_TOKENS,
+                "use_queues": True,
+            }
+            if self.backend == "vllm":
+                prediction_options["max_pixels"] = _PADDLE_MAX_PIXELS
+            iterator = self._engine.predict_iter(list(images), **prediction_options)
+            for result in iterator:
+                output.append(result)
         if len(output) != len(images):
             raise OCRProcessingError("PaddleOCR-VL returned an unexpected number of frame results.")
         return output
@@ -128,102 +283,41 @@ class PaddleOCRVLEngine:
         self._engine = None
 
 
-class FallbackOCREngine:
-    """Use RapidOCR for empty VL results and disable VL after any runtime failure."""
-
-    def __init__(self, primary: FrameOCR, fallback: FrameOCR, on_fallback=None) -> None:
-        self.primary = primary
-        self.fallback = fallback
-        self.on_fallback = on_fallback
-        self._primary_enabled = True
-        self.engine_name = primary.engine_name
-        self.device_name = primary.device_name
-
-    def recognize_batch(self, images: Sequence[Any]) -> list[list[OCRText]]:
-        if not self._primary_enabled:
-            return self.fallback.recognize_batch(images)
-        try:
-            primary_results = self.primary.recognize_batch(images)
-        except Exception as exc:
-            self._disable_primary(str(exc))
-            return self.fallback.recognize_batch(images)
-        output = []
-        for image, entries in zip(images, primary_results):
-            if _usable(entries, image):
-                output.append(entries)
-            else:
-                output.append(self.fallback.recognize_batch([image])[0])
-        return output
-
-    def _disable_primary(self, reason: str) -> None:
-        if not self._primary_enabled:
-            return
-        self._primary_enabled = False
-        self.primary.close()
-        self.engine_name = self.fallback.engine_name
-        self.device_name = self.fallback.device_name
-        if self.on_fallback is not None:
-            self.on_fallback(reason)
-
-    def close(self) -> None:
-        self.primary.close()
-        self.fallback.close()
-
-
-def create_rapid_engine(cpu_threads: int | None = None) -> FrameOCR:
-    threads = cpu_threads if cpu_threads is not None else max(1, min(8, os.cpu_count() or 1))
-    return RapidOCREngine(threads)
-
-
-def create_paddle_vl_engine(device: str, cpu_threads: int, batch_size: int) -> FrameOCR:
-    return PaddleOCRVLEngine(device, cpu_threads, batch_size)
-
-
-def create_ocr_engine(on_model_load: Callable[[], None] | None = None) -> FrameOCR:
-    """Compatibility constructor for callers that need a RapidOCR CPU engine."""
-    if on_model_load is not None:
-        on_model_load()
-    return create_rapid_engine()
-
-
-def create_ocr_runtime(resources=None, on_model_load=None, on_fallback=None):
-    """Detect available resources, initialize the selected engine, and warm it up."""
+def create_ocr_runtime(
+    resources=None,
+    on_model_load=None,
+    server_url: str | None = None,
+    concurrency: int | None = None,
+    backend: str = "auto",
+):
+    """Connect the PaddleOCR client to the hardware-appropriate local inference service."""
     from .resources import detect_system_resources, plan_ocr_resources
 
     system = resources or detect_system_resources()
-    cuda_ready = False
-    if system.nvidia_device_visible:
-        try:
-            import paddle
-
-            cuda_ready = paddle.device.cuda.device_count() > 0
-        except Exception:
-            cuda_ready = False
-    plan = plan_ocr_resources(system, cuda_ready)
+    if backend == "auto":
+        backend = "vllm" if _nvidia_gpu_available() else "llama-cpp"
+    if backend not in {"vllm", "llama-cpp"}:
+        raise OCRProcessingError(f"Unsupported OCR service backend: {backend}.")
+    if concurrency is not None and concurrency < 1:
+        raise OCRProcessingError("OCR service concurrency must be a positive integer.")
+    if server_url is None:
+        port = 8118 if backend == "vllm" else 8111
+        server_url = f"http://127.0.0.1:{port}/v1"
+    plan = plan_ocr_resources(system, concurrency, backend)
     if on_model_load is not None:
         on_model_load()
-    if plan.engine == "rapidocr":
-        return create_rapid_engine(plan.cpu_threads), plan
-    if sys.platform == "darwin":
-        plan = _rapid_plan(plan)
-        return create_rapid_engine(plan.cpu_threads), plan
-    try:
-        import importlib.util
+    import importlib.util
 
-        if importlib.util.find_spec("paddleocr") is None:
-            if on_fallback is not None:
-                on_fallback("PaddleOCR is not installed in this Python environment")
-            plan = _rapid_plan(plan)
-            return create_rapid_engine(plan.cpu_threads), plan
-    except (ImportError, ValueError):
-        if on_fallback is not None:
-            on_fallback("PaddleOCR is not installed in this Python environment")
-        plan = _rapid_plan(plan)
-        return create_rapid_engine(plan.cpu_threads), plan
+    if importlib.util.find_spec("paddleocr") is None:
+        raise DependencyError(
+            "PaddleOCR is missing from the client environment. Run ./scripts/configure --setup."
+        )
     try:
-        vl_device = f"gpu:{plan.device_id or 0}" if plan.device == "cuda" else "cpu"
-        vl = create_paddle_vl_engine(vl_device, plan.cpu_threads, plan.batch_size)
-        # Small in-memory warm-up catches missing model files and unusable CUDA contexts.
+        vl = PaddleOCRVLEngine(
+            plan.cpu_threads, plan.batch_size, backend=backend,
+            server_url=server_url, concurrency=plan.batch_size
+        )
+        # In-memory warm-up confirms the local pipeline and configured service cooperate.
         import numpy as np
 
         vl.recognize_batch([np.zeros((160, 640, 3), dtype=np.uint8)])
@@ -232,18 +326,27 @@ def create_ocr_runtime(resources=None, on_model_load=None, on_fallback=None):
             vl.close()
         except (UnboundLocalError, AttributeError):
             pass
-        if on_fallback is not None:
-            on_fallback(str(exc))
-        plan = _rapid_plan(plan)
-        return create_rapid_engine(plan.cpu_threads), plan
-    rapid = create_rapid_engine(plan.cpu_threads)
-    return FallbackOCREngine(vl, rapid, on_fallback), plan
+        hint = (
+            f"Start it with ./scripts/{'vlm-server.sh' if backend == 'vllm' else 'llama-server.sh'} start."
+            if server_url.startswith("http://127.0.0.1")
+            else "Check the configured service URL."
+        )
+        raise OCRProcessingError(
+            f"Could not initialize the PaddleOCR-VL client or reach the {backend} service at {server_url}. {hint} {exc}"
+        ) from exc
+    return vl, plan
 
 
-def _rapid_plan(plan):
-    from dataclasses import replace
-
-    return replace(plan, engine="rapidocr", device="cpu", device_id=None, batch_size=1)
+def _nvidia_gpu_available() -> bool:
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and "GPU" in result.stdout
 
 
 def subtitle_from_frames(
@@ -255,32 +358,66 @@ def subtitle_from_frames(
 ) -> str | None:
     """Recognize caption-like text in bounded batches and convert stable detections into SRT."""
     detections: list[tuple[float, str]] = []
-    next_progress = 0.0
+    next_progress = 1.0
     if on_progress is not None:
         on_progress(0.0, duration)
-    size = max(1, batch_size)
+    controller = OCRBatchController(maximum_batch_size=max(1, batch_size))
+    size = controller.batch_size
     batch: list[tuple[float, Any]] = []
 
-    def consume(items: list[tuple[float, Any]]) -> None:
+    def consume(items: list[tuple[float, Any]], adapt: bool = True) -> None:
         if not items:
             return
-        results = engine.recognize_batch([image for _, image in items])
+        started = time.monotonic()
+        recovered_from_memory = False
+
+        def recognize(frame_items: list[tuple[float, Any]]) -> list[list[OCRText]]:
+            nonlocal recovered_from_memory
+            try:
+                return engine.recognize_batch([image for _, image in frame_items])
+            except OCRProcessingError as exc:
+                if len(frame_items) <= 1 or not _is_memory_pressure_error(exc):
+                    raise
+                reduced = controller.back_off_after_memory_error(len(frame_items))
+                recovered_from_memory = True
+                print(
+                    f"[WARN] OCR batch hit a memory limit; retrying at concurrency {reduced}.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                recovered: list[list[OCRText]] = []
+                for start in range(0, len(frame_items), reduced):
+                    recovered.extend(recognize(frame_items[start : start + reduced]))
+                return recovered
+
+        results = recognize(items)
+        elapsed = time.monotonic() - started
         if len(results) != len(items):
             raise OCRProcessingError("OCR returned an unexpected number of frame results.")
+        if adapt and not recovered_from_memory and len(items) == size and controller.maximum_batch_size > 1:
+            observation = controller.observe(len(items), elapsed)
+            log_batch_observation(
+                observation,
+                logger=lambda message: print(message, file=sys.stderr, flush=True),
+            )
         for (timestamp, image), entries in zip(items, results):
-            if on_progress is not None and timestamp >= next_progress:
-                on_progress(float(timestamp), duration)
             caption = _caption_from_entries(entries, image)
             if caption:
                 detections.append((float(timestamp), caption))
 
     try:
+        frame_selector = getattr(engine, "should_process_frame", None)
         for timestamp, image in frames:
+            if on_progress is not None and timestamp >= next_progress:
+                on_progress(float(timestamp), duration)
+                next_progress = float(timestamp) + 1.0
+            if frame_selector is not None and not frame_selector(timestamp, image):
+                continue
             batch.append((timestamp, image))
             if len(batch) >= size:
                 consume(batch)
                 batch = []
-                next_progress = float(timestamp) + 1.0
+                size = controller.batch_size
         consume(batch)
     except OCRProcessingError:
         raise
@@ -312,26 +449,15 @@ def subtitle_from_frames(
         raise OCRProcessingError(f"Could not turn OCR captions into SRT: {exc}") from exc
 
 
-def _rapid_result(result: Any) -> list[OCRText]:
-    if result is None:
-        return []
-    texts = getattr(result, "txts", None)
-    boxes = getattr(result, "boxes", None)
-    scores = getattr(result, "scores", None)
-    if texts is None or boxes is None:
-        return []
-    output = []
-    for index, (box, text) in enumerate(zip(boxes, texts)):
-        score = None
-        try:
-            score = float(scores[index]) if scores is not None else None
-        except (IndexError, TypeError, ValueError):
-            pass
-        output.append(OCRText(str(text), _normalize_box(box), score))
-    return output
+def _is_memory_pressure_error(error: Exception) -> bool:
+    message = str(error).casefold()
+    return any(
+        marker in message
+        for marker in ("out of memory", "cuda oom", "memoryerror", "kv cache is full", "failed to allocate")
+    )
 
 
-def _paddle_result(result: Any) -> list[OCRText]:
+def _paddle_result(result: Any, allow_full_crop: bool = False) -> list[OCRText]:
     value = getattr(result, "json", None)
     if callable(value):
         value = value()
@@ -339,26 +465,103 @@ def _paddle_result(result: Any) -> list[OCRText]:
         value = result
     if not isinstance(value, dict):
         return []
-    # PaddleOCR-VL 1.6 returns a JSON dictionary with parsing_res_list blocks.
+    # Spotting mode returns localized polygons, while the llama.cpp route's
+    # ordinary OCR prompt currently returns text blocks over the full crop.
     if isinstance(value.get("res"), dict):
         value = value["res"]
-    blocks = value.get("parsing_res_list") or []
-    output = []
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        text = block.get("block_content") or block.get("text")
+    spotting = value.get("spotting_res") or {}
+    if not isinstance(spotting, dict):
+        spotting = {}
+    texts = spotting.get("rec_texts") or []
+    polygons = spotting.get("rec_polys") or []
+    if not isinstance(texts, (list, tuple)) or not isinstance(polygons, (list, tuple)):
+        return []
+    output: list[OCRText] = []
+    for text, polygon in zip(texts, polygons):
         if not isinstance(text, str) or not text.strip():
             continue
-        label = str(block.get("block_label") or "").lower()
-        if label in {"image", "table", "figure", "formula", "chart", "seal"}:
+        box = _normalize_box(polygon)
+        if box is not None:
+            output.append(OCRText(text, box, None))
+    if output or not allow_full_crop:
+        return output
+    for block in value.get("parsing_res_list", []) or []:
+        if not isinstance(block, dict):
             continue
-        raw_box = block.get("block_bbox")
-        if raw_box is None:
-            raw_box = block.get("bbox")
-        box = _normalize_box(raw_box)
-        output.append(OCRText(text, box, None))
+        text = block.get("block_content")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        box = _normalize_box(block.get("block_bbox"))
+        if box is not None:
+            output.append(OCRText(text, box, None))
     return output
+
+
+def _has_caption_region_text(polygons: Any, width: int, height: int) -> bool:
+    return bool(_caption_layout_signature(polygons, width, height))
+
+
+def _caption_layout_signature(
+    polygons: Any, width: int, height: int
+) -> tuple[tuple[int, int, int], ...]:
+    if not isinstance(polygons, (list, tuple)):
+        return ()
+    boxes: list[tuple[float, float, float]] = []
+    for polygon in polygons:
+        try:
+            xs = [float(point[0]) for point in polygon]
+            ys = [float(point[1]) for point in polygon]
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not xs or not ys:
+            continue
+        box_width = max(xs) - min(xs)
+        box_height = max(ys) - min(ys)
+        center_y = (min(ys) + max(ys)) / 2
+        if (
+            center_y >= height * 0.2
+            and center_y <= height * 0.96
+            and box_width >= width * 0.01
+            and box_height >= height * 0.015
+            and box_height <= max(box_width / 0.55, height * 0.08)
+        ):
+            boxes.append((min(xs) / max(1, width), max(xs) / max(1, width), center_y / max(1, height)))
+    if not boxes:
+        return ()
+
+    boxes.sort(key=lambda box: box[2])
+    lines: list[list[tuple[float, float, float]]] = []
+    for box in boxes:
+        matching = next(
+            (line for line in lines if abs(box[2] - sum(item[2] for item in line) / len(line)) <= 0.10),
+            None,
+        )
+        if matching is None:
+            lines.append([box])
+        else:
+            matching.append(box)
+    return tuple(
+        (
+            round(min(box[0] for box in line) * 20),
+            round(max(box[1] for box in line) * 20),
+            round(sum(box[2] for box in line) / len(line) * 20),
+        )
+        for line in lines
+    )
+
+
+def _caption_layout_changed(
+    previous: tuple[tuple[int, int, int], ...],
+    current: tuple[tuple[int, int, int], ...],
+) -> bool:
+    if len(previous) != len(current):
+        return True
+    return any(
+        abs(left[0] - right[0]) >= 1
+        or abs(left[1] - right[1]) >= 1
+        or abs(left[2] - right[2]) >= 1
+        for left, right in zip(previous, current)
+    )
 
 
 def _normalize_box(value: Any) -> tuple[tuple[float, float], ...] | None:
@@ -375,8 +578,47 @@ def _normalize_box(value: Any) -> tuple[tuple[float, float], ...] | None:
 
 def _subtitle_crop(image: Any) -> Any:
     height = int(image.shape[0])
-    top = int(height * _LOWER_FRAME_RATIO)
+    top = int(height * _PADDLE_SUBTITLE_CROP_RATIO)
     return image[top:, :]
+
+
+def _resize_images_to_pixel_limit(
+    images: Sequence[Any], max_pixels: int
+) -> tuple[list[Any], list[tuple[float, float]]]:
+    import cv2
+
+    resized_images = []
+    scales = []
+    for image in images:
+        height, width = image.shape[:2]
+        scale = min(1.0, (max_pixels / max(1, width * height)) ** 0.5)
+        if scale < 1.0:
+            resized_width = max(1, int(width * scale))
+            resized_height = max(1, int(height * scale))
+            resized = cv2.resize(
+                image, (resized_width, resized_height), interpolation=cv2.INTER_AREA
+            )
+        else:
+            resized_width, resized_height = width, height
+            resized = image
+        resized_images.append(resized)
+        scales.append((width / resized_width, height / resized_height))
+    return resized_images, scales
+
+
+def _scale_entries(
+    entries: list[OCRText], scale_x: float, scale_y: float
+) -> list[OCRText]:
+    return [
+        OCRText(
+            entry.text,
+            tuple((x * scale_x, y * scale_y) for x, y in entry.box)
+            if entry.box is not None
+            else None,
+            entry.confidence,
+        )
+        for entry in entries
+    ]
 
 
 def _offset_entries(entries: list[OCRText], vertical_offset: int) -> list[OCRText]:
@@ -390,16 +632,12 @@ def _offset_entries(entries: list[OCRText], vertical_offset: int) -> list[OCRTex
     ]
 
 
-def _usable(entries: list[OCRText], image: Any) -> bool:
-    return bool(_caption_from_entries(entries, image))
-
-
 def _caption_from_entries(entries: list[OCRText], image: Any) -> str | None:
     height = int(image.shape[0])
     lines: list[tuple[float, float, str]] = []
     for entry in entries:
         cleaned = _clean_text(entry.text)
-        if not cleaned or (entry.confidence is not None and entry.confidence < _MIN_CONFIDENCE):
+        if not cleaned:
             continue
         if entry.box is None:
             continue

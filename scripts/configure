@@ -5,12 +5,29 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE="$ROOT/.ocr-environment"
 TOOLS="$ROOT/.tools"
 ENVS="$ROOT/.envs"
+source "$ROOT/environment/ocr-versions.env"
+MINIFORGE_INSTALLER="$TOOLS/Miniforge3-${MINIFORGE_VERSION}-Linux-x86_64.sh"
+MINIFORGE_CHECKSUM="$MINIFORGE_INSTALLER.sha256"
+DOWNLOAD_ROOT="$DOWNLOAD_DIR"
+if [[ "$DOWNLOAD_ROOT" != /* ]]; then
+  DOWNLOAD_ROOT="$ROOT/$DOWNLOAD_ROOT"
+fi
+LOG_ROOT="$LOG_DIR"
+if [[ "$LOG_ROOT" != /* ]]; then
+  LOG_ROOT="$ROOT/$LOG_ROOT"
+fi
+if command -v realpath >/dev/null 2>&1; then
+  LOG_ROOT="$(realpath -m -- "$LOG_ROOT")"
+fi
 
 COLOR_RESET=""
 COLOR_GREEN=""
 COLOR_YELLOW=""
 COLOR_RED=""
 COLOR_CYAN=""
+COLOR_SUPPORTED=0
+ORIGINAL_STDIN_TTY=0
+[[ -t 0 ]] && ORIGINAL_STDIN_TTY=1
 if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb && -z "${NO_COLOR+x}" ]]; then
   color_count=0
   if command -v tput >/dev/null 2>&1; then
@@ -19,6 +36,7 @@ if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb && -z "${NO_COLOR+x}" ]]; then
     color_count=8
   fi
   if [[ "$color_count" =~ ^[0-9]+$ ]] && (( color_count >= 8 )); then
+    COLOR_SUPPORTED=1
     COLOR_RESET=$'\033[0m'
     COLOR_GREEN=$'\033[32m'
     COLOR_YELLOW=$'\033[33m'
@@ -28,16 +46,101 @@ if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb && -z "${NO_COLOR+x}" ]]; then
 fi
 
 say() { printf '%s%s%s\n' "$1" "$2" "$COLOR_RESET"; }
-ok() { say "$COLOR_GREEN" "[OK] $1"; }
+ok() { printf '%s%-3s%s | %s\n' "$COLOR_GREEN" 'YES' "$COLOR_RESET" "$1"; }
 info() { say "$COLOR_CYAN" "[INFO] $1"; }
-warn() { say "$COLOR_YELLOW" "[MISSING] $1"; }
+warn() { printf '%s%-3s%s | %s\n' "$COLOR_YELLOW" 'NO' "$COLOR_RESET" "$1"; }
 fail() { say "$COLOR_RED" "[ERROR] $1" >&2; }
+
+run_child_command() {
+  local label="$1"
+  shift
+  local quiet="$1"
+  shift
+  local monitor_was_enabled=0
+  [[ "$-" == *m* ]] && monitor_was_enabled=1
+  # Put the installer in its own process group without starting a new
+  # session. A new session loses its controlling TTY, which makes libmamba
+  # misread the terminal width and draw enormous progress bars.
+  set -m
+  if [[ "$quiet" == 1 ]]; then
+    "$@" >/dev/null 2>&1 &
+  else
+    info "Starting: $label"
+    "$@" &
+  fi
+  local command_pid=$!
+  if (( ! monitor_was_enabled )); then
+    # The child keeps the process group assigned at launch, while the shell
+    # returns to normal mode without printing job-completion notices.
+    set +m
+  fi
+  ACTIVE_CHILD_PID="$command_pid"
+  local running=0
+  while :; do
+    running=0
+    while IFS= read -r job_pid; do
+      [[ "$job_pid" == "$command_pid" ]] && running=1
+    done < <(jobs -pr 2>/dev/null)
+    (( running )) || break
+    sleep 1 2>/dev/null
+  done
+  local command_status=0
+  wait "$command_pid" 2>/dev/null || command_status=$?
+  ACTIVE_CHILD_PID=""
+  if [[ "$quiet" != 1 ]]; then
+    if (( command_status == 0 )); then
+      info "Completed: $label"
+    else
+      fail "Failed: $label (exit $command_status)."
+    fi
+  fi
+  return "$command_status"
+}
+
+ACTIVE_CHILD_PID=""
+ACTIVE_ENV_PREFIX=""
+interrupt_configure() {
+  trap - INT TERM
+  if [[ -n "$ACTIVE_CHILD_PID" ]]; then
+    # libmamba may block SIGINT while parallel shard requests are active.
+    # Terminate its shell-created process group explicitly on Ctrl+C.
+    kill -TERM -- "-$ACTIVE_CHILD_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      if ! kill -0 -- "-$ACTIVE_CHILD_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    kill -KILL -- "-$ACTIVE_CHILD_PID" 2>/dev/null || true
+    wait "$ACTIVE_CHILD_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$ACTIVE_ENV_PREFIX" ]]; then
+    rm -rf -- "$ACTIVE_ENV_PREFIX"
+    rm -f -- "$STATE"
+  fi
+  printf '\n[INFO] Operation interrupted; installer process stopped. Any incomplete setup environment was removed.\n' >&2
+  exit 130
+}
+trap interrupt_configure INT TERM
 
 setup=0
 assume_yes=0
+operation=check
+operation_selected=0
 for argument in "$@"; do
   case "$argument" in
-    --setup) setup=1 ;;
+    --setup|--clean|--distclean)
+      if (( operation_selected )); then
+        fail '--setup, --clean, and --distclean are mutually exclusive.'
+        exit 2
+      fi
+      operation_selected=1
+      case "$argument" in
+        --setup) operation=setup; setup=1 ;;
+        --clean) operation=clean ;;
+        --distclean) operation=distclean ;;
+      esac
+      ;;
     --yes|-y) assume_yes=1 ;;
     --help|-h)
       cat <<'USAGE'
@@ -45,20 +148,182 @@ Usage:
   ./scripts/configure                 Check dependencies and environment status
   ./scripts/configure --setup         Install the project OCR environment
   ./scripts/configure --setup --yes   Install without confirmation prompts
+  ./scripts/configure --clean         Remove runtime-generated cache files
+  ./scripts/configure --distclean     Remove caches and project OCR environments
+  ./scripts/configure --distclean --yes  Remove them without confirmation
 USAGE
       exit 0
       ;;
     *) fail "Unknown option: $argument"; exit 2 ;;
   esac
 done
-if (( assume_yes && ! setup )); then
-  fail '--yes is valid only together with --setup.'
+if (( assume_yes )) && [[ "$operation" == check ]]; then
+  fail '--yes must be used together with --setup, --clean, or --distclean.'
   exit 2
 fi
 
 if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   fail 'This configure script supports Linux x86_64 only.'
   exit 1
+fi
+case "$LOG_ROOT" in
+  /|"$ROOT"|"$ROOT/.git"|"$ROOT/src"|"$ROOT/scripts"|"$ROOT/environment"|"$ROOT/downloads"|"$ROOT/.tools"|"$ROOT/.envs"|"$ROOT/.venv")
+    fail "Unsafe LOG_DIR: $LOG_ROOT"
+    exit 2
+    ;;
+esac
+
+# Run the full installer in a PTY when `script` is available. Package
+# installers then retain their native progress bars while `script` records
+# the same terminal stream in the configuration log.
+if [[ -z "${CONFIGURE_CAPTURED:-}" ]]; then
+  save_logs="${SAVE_LOGS:-true}"
+  save_logs="${save_logs,,}"
+  case "$save_logs" in
+    1|true|yes|on) save_logs=1 ;;
+    *) save_logs=0 ;;
+  esac
+if (( save_logs )); then
+    mkdir -p "$LOG_ROOT/configure"
+    config_log="$LOG_ROOT/configure/configure-$(date +%Y%m%d-%H%M%S)-$$.log"
+  else
+    config_log=/dev/null
+  fi
+  export CONFIGURE_CAPTURED=1
+  export CONFIGURE_SAVE_LOGS="$save_logs"
+  export CONFIGURE_LOG_PATH="$config_log"
+  export CONFIGURE_COLOR_SUPPORTED="$COLOR_SUPPORTED"
+  export CONFIGURE_ORIGINAL_STDIN_TTY="$ORIGINAL_STDIN_TTY"
+  export PIP_PROGRESS_BAR=on
+  if command -v script >/dev/null 2>&1; then
+    printf -v configure_command '%q ' "$0" "$@"
+    # Preserve the caller's terminal size for native installer progress bars.
+    # Only assign a fallback size when stdout is not an interactive terminal
+    # or its dimensions are unavailable.
+    terminal_size=''
+    if [[ -t 1 && -r /dev/tty ]]; then
+      terminal_size="$(stty size </dev/tty 2>/dev/null || true)"
+    fi
+    read -r terminal_rows terminal_cols <<< "$terminal_size"
+    if [[ ! "${terminal_rows:-}" =~ ^[1-9][0-9]*$ || ! "${terminal_cols:-}" =~ ^[1-9][0-9]*$ ]]; then
+      configure_command="stty cols 100 rows 40 2>/dev/null || true; export COLUMNS=100 LINES=40; $configure_command"
+    fi
+    configure_status=0
+    script -qefc "$configure_command" "$config_log" || configure_status=$?
+    # --distclean removes the active configuration log directory by design.
+    # Only sanitize a log that still exists after the captured process exits.
+    if (( save_logs )) && [[ -f "$config_log" ]]; then
+      clean_log="${config_log}.clean"
+      if LC_ALL=C sed -E $'s#\033\\[[0-?]*[ -/]*[@-~]##g' "$config_log" > "$clean_log"; then
+        mv -- "$clean_log" "$config_log"
+      else
+        rm -f -- "$clean_log"
+        printf '[WARN] Could not remove terminal color/control sequences from the configuration log.\n' >&2
+      fi
+    fi
+    exit "$configure_status"
+  fi
+  if (( save_logs )); then
+    exec > >(tee -a "$config_log") 2>&1
+  fi
+fi
+if [[ "${CONFIGURE_COLOR_SUPPORTED:-1}" != 1 ]]; then
+  COLOR_RESET="" COLOR_GREEN="" COLOR_YELLOW="" COLOR_RED="" COLOR_CYAN=""
+fi
+if [[ "${CONFIGURE_SAVE_LOGS:-0}" == 1 && -n "${CONFIGURE_LOG_PATH:-}" ]]; then
+  info "Configuration output is being saved to: $CONFIGURE_LOG_PATH"
+fi
+
+confirm_action() {
+  local prompt="$1"
+  local answer=''
+  (( assume_yes )) && return 0
+  if [[ "${CONFIGURE_ORIGINAL_STDIN_TTY:-1}" != 1 ]]; then
+    fail 'This operation needs confirmation in an interactive terminal; pass --yes to confirm explicitly.'
+    return 2
+  fi
+  printf '%s [y/N] ' "$prompt"
+  read -r answer || answer=''
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) info 'Operation cancelled.'; return 1 ;;
+  esac
+}
+
+clean_runtime_artifacts() {
+  info 'Removing runtime-generated subtitle outputs and cache files; preserving download caches.'
+  if [[ -x "$ROOT/scripts/vlm-server.sh" ]]; then
+    "$ROOT/scripts/vlm-server.sh" stop || warn 'Could not stop the project-local vLLM server cleanly.'
+  fi
+  if [[ -x "$ROOT/scripts/llama-server.sh" ]]; then
+    "$ROOT/scripts/llama-server.sh" stop || warn 'Could not stop the project-local llama.cpp server cleanly.'
+  fi
+  rm -rf -- "$ROOT/output/.tmp-vlm-server" "$ROOT/output/.tmp-llama-server"
+  find "$ROOT" \
+    -path "$ROOT/.git" -prune -o \
+    -path "$ROOT/.envs" -prune -o \
+    -path "$ROOT/.tools" -prune -o \
+    -path "$ROOT/.venv" -prune -o \
+    -path "$ROOT/venv" -prune -o \
+    -path "$ROOT/.venv-ocr-gpu" -prune -o \
+    -path "$ROOT/.venv-ocr-cpu" -prune -o \
+    -path "$DOWNLOAD_ROOT" -prune -o \
+    -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' \) -prune -exec rm -rf -- {} + -o \
+    -type f \( -name '*.pyc' -o -name '*.pyo' \) -exec rm -f -- {} + -o \
+    -type f -iname '*.srt' -exec rm -f -- {} +
+  ok 'Runtime cache cleanup complete.'
+}
+
+if [[ "$operation" == clean || "$operation" == distclean ]]; then
+  if [[ "$operation" == clean ]]; then
+    if confirm_action 'Remove runtime-generated cache files from this project?'; then
+      clean_runtime_artifacts
+      exit 0
+    else
+      result=$?
+      (( result == 1 )) && exit 0 || exit "$result"
+    fi
+  fi
+
+  if confirm_action 'Remove runtime caches, downloaded files, and project OCR environments?'; then
+    :
+  else
+    result=$?
+    (( result == 1 )) && exit 0 || exit "$result"
+  fi
+
+  resolved_download_root=''
+  if [[ -d "$DOWNLOAD_ROOT" ]]; then
+    resolved_download_root="$(cd -- "$DOWNLOAD_ROOT" && pwd -P)"
+    case "$resolved_download_root" in
+      /|"$ROOT"|"$ROOT/.git"|"$ROOT/.git/"*|"$ROOT/.envs"|"$ROOT/.envs/"*|"$ROOT/.tools"|"$ROOT/.tools/"*|"$ROOT/src"|"$ROOT/src/"*|"$ROOT/.venv"|"$ROOT/.venv/"*|"$ROOT/venv"|"$ROOT/venv/"*|"$ROOT/.venv-ocr-"*)
+        fail "Refusing to remove managed cache directories from unsafe DOWNLOAD_DIR: $resolved_download_root"
+        exit 2
+        ;;
+    esac
+  fi
+
+  clean_runtime_artifacts
+  if [[ -n "$resolved_download_root" ]]; then
+    for cache_name in pip conda mamba xdg huggingface paddlex torch llama.cpp paddleocr-vl-gguf; do
+      cache_path="$resolved_download_root/$cache_name"
+      if [[ -e "$cache_path" || -L "$cache_path" ]]; then
+        rm -rf -- "$cache_path"
+        info "Removed downloaded cache: $cache_path"
+      fi
+    done
+  fi
+
+  rm -rf -- "$ENVS" "$ROOT/.venv-ocr-gpu" "$ROOT/.venv-ocr-cpu" \
+    "$TOOLS/miniforge3" "$TOOLS/mamba-root" "$ROOT/.runtime"
+  rm -f -- "$STATE" "$TOOLS/micromamba" "$TOOLS/micromamba.new" "$TOOLS/micromamba.sha256" \
+    "$MINIFORGE_INSTALLER" "$MINIFORGE_CHECKSUM" \
+    "$TOOLS/Miniforge3-Linux-x86_64.sh" "$TOOLS/Miniforge3-Linux-x86_64.sh.sha256"
+  rmdir -- "$TOOLS" 2>/dev/null || true
+  rm -rf -- "$LOG_ROOT/configure" "$LOG_ROOT/run"
+  rmdir -- "$LOG_ROOT" 2>/dev/null || true
+  ok 'Deep cleanup complete. Run ./scripts/configure --setup to configure the environment again.'
+  exit 0
 fi
 
 if (( ! setup )); then
@@ -76,37 +341,134 @@ if (( ! setup )); then
     warn 'No SHA-256 utility (sha256sum or shasum) is available; installation may need a system package manager.'
     missing_system_tools=1
   fi
-  if command -v micromamba >/dev/null 2>&1 || [[ -x "$TOOLS/micromamba" ]]; then
-    ok 'micromamba is available.'
+  if command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version >/dev/null 2>&1; then
+    ok "System FFmpeg is available ($(command -v ffmpeg))."
   else
-    info 'micromamba is not installed; --setup will download it into .tools/ (no administrator access needed).'
+    info 'System FFmpeg is not on PATH; this is optional because --setup provides FFmpeg in the project environment.'
   fi
+  if command -v ffprobe >/dev/null 2>&1 && ffprobe -version >/dev/null 2>&1; then
+    ok "System FFprobe is available ($(command -v ffprobe))."
+  else
+    info 'System FFprobe is not on PATH; this is optional because --setup provides FFprobe in the project environment.'
+  fi
+  if [[ -x "$TOOLS/miniforge3/bin/conda" ]]; then
+    ok 'Project-local Miniforge Conda is available.'
+  else
+    warn 'Project-local Miniforge Conda is not installed; --setup downloads it into .tools/ without administrator access.'
+  fi
+  info "Package and model download cache: $DOWNLOAD_ROOT"
   if [[ -f "$STATE" ]]; then
     # The state file is generated by configure and contains only mode/prefix assignments.
     source "$STATE"
     if [[ -d "${prefix:-}" ]]; then
       ok "An OCR environment is configured ($mode)."
-      if command -v micromamba >/dev/null 2>&1; then
-        MAMBA="$(command -v micromamba)"
+      CONDA="$TOOLS/miniforge3/bin/conda"
+      export CONDA_PKGS_DIRS="$DOWNLOAD_ROOT/conda"
+      export PIP_CACHE_DIR="$DOWNLOAD_ROOT/pip"
+      export XDG_CACHE_HOME="$DOWNLOAD_ROOT/xdg"
+      export HF_HOME="$DOWNLOAD_ROOT/huggingface"
+      export HF_HUB_CACHE="$DOWNLOAD_ROOT/huggingface/hub"
+      export PADDLE_PDX_CACHE_HOME="$DOWNLOAD_ROOT/paddlex"
+      export TORCH_HOME="$DOWNLOAD_ROOT/torch"
+      if [[ -x "$CONDA" ]] && "$CONDA" run --no-capture-output -p "$prefix" python -c 'import sys; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
+        ok 'Project Python runtime (3.10 or newer).'
       else
-        MAMBA="$TOOLS/micromamba"
+        warn 'Project Python runtime (3.10 or newer); run ./scripts/configure --setup.'
       fi
-      export MAMBA_ROOT_PREFIX="$TOOLS/mamba-root"
-      if "$MAMBA" run -p "$prefix" python -c 'import av, faster_whisper, onnxruntime, psutil, rapidocr, yt_dlp; import paddle; from paddleocr import PaddleOCRVL; import shutil; assert shutil.which("ffmpeg") and shutil.which("ffprobe")' >/dev/null 2>&1; then
-        ok 'Application, RapidOCR, Paddle, and PaddleOCR-VL Python dependencies import successfully.'
-      else
-        warn 'One or more Python dependencies are missing or cannot import; run ./scripts/configure --setup.'
-      fi
+      check_env_command() {
+        local label="$1"
+        shift
+        if run_child_command "Checking $label" 1 "$CONDA" run --no-capture-output -p "$prefix" "$@"; then
+          ok "$label"
+        else
+          warn "$label; run ./scripts/configure --setup."
+        fi
+      }
+      check_env_import() {
+        local label="$1"
+        local expression="$2"
+        if run_child_command "Checking $label" 1 "$CONDA" run --no-capture-output -p "$prefix" python -c "$expression"; then
+          ok "$label"
+        else
+          warn "$label; run ./scripts/configure --setup."
+        fi
+      }
+      check_env_command 'Project FFmpeg executable' ffmpeg -version
+      check_env_command 'Project FFprobe executable' ffprobe -version
+      check_env_command 'Python pip installer' python -m pip --version
+      check_env_import 'Python package: PyAV (av)' 'import av'
+      check_env_import 'Python package: faster-whisper (ASR)' 'import faster_whisper'
+      check_env_import 'ASR dependency: ONNX Runtime (required by faster-whisper)' 'import onnxruntime'
+      check_env_import 'Python package: psutil (resource detection)' 'import psutil'
+      check_env_import 'Python package: yt-dlp (online video)' 'import yt_dlp'
+      check_env_import 'Python package: PaddlePaddle CPU client' 'import paddle; assert not paddle.is_compiled_with_cuda()'
+      check_env_import 'Python package: PaddleOCR-VL client' 'from paddleocr import PaddleOCRVL'
+      check_env_import 'CPU subtitle detector model' 'from pathlib import Path; import os; assert (Path(os.environ["PADDLE_PDX_CACHE_HOME"]) / "official_models" / "PP-OCRv5_mobile_det" / "inference.pdiparams").is_file()'
+      check_env_import 'Project CLI package' 'import video_subtitles.cli'
     else
       warn 'The saved OCR environment directory is missing; run ./scripts/configure --setup.'
+      warn 'Project Python runtime (3.10 or newer); environment is not configured.'
+      warn 'Project FFmpeg executable; environment is not configured.'
+      warn 'Project FFprobe executable; environment is not configured.'
+      warn 'Python pip installer; environment is not configured.'
+      warn 'Python package: PyAV (av); environment is not configured.'
+      warn 'Python package: faster-whisper (ASR); environment is not configured.'
+      warn 'ASR dependency: ONNX Runtime (required by faster-whisper); environment is not configured.'
+      warn 'Python package: psutil (resource detection); environment is not configured.'
+      warn 'Python package: yt-dlp (online video); environment is not configured.'
+      warn 'Python package: PaddlePaddle CPU client; environment is not configured.'
+      warn 'Python package: PaddleOCR-VL client; environment is not configured.'
+      warn 'CPU subtitle detector model; environment is not configured.'
+      warn 'Project CLI package; environment is not configured.'
     fi
   else
     warn 'No OCR environment is configured; run ./scripts/configure --setup.'
+    warn 'Project Python runtime (3.10 or newer); environment is not configured.'
+    warn 'Project FFmpeg executable; environment is not configured.'
+    warn 'Project FFprobe executable; environment is not configured.'
+    warn 'Python pip installer; environment is not configured.'
+    warn 'Python package: PyAV (av); environment is not configured.'
+    warn 'Python package: faster-whisper (ASR); environment is not configured.'
+    warn 'ASR dependency: ONNX Runtime (required by faster-whisper); environment is not configured.'
+    warn 'Python package: psutil (resource detection); environment is not configured.'
+    warn 'Python package: yt-dlp (online video); environment is not configured.'
+    warn 'Python package: PaddlePaddle CPU client; environment is not configured.'
+    warn 'Python package: PaddleOCR-VL client; environment is not configured.'
+    warn 'Project CLI package; environment is not configured.'
   fi
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    ok "NVIDIA GPU detected: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)"
+      ok "Optional NVIDIA GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)"
+    server_python="$ROOT/.envs/ocr-vlm-server/bin/python"
+    server_ccache="$ROOT/.envs/ocr-vlm-server/bin/ccache"
+    if [[ -x "$server_python" && -x "$server_ccache" ]] && "$server_ccache" --version >/dev/null 2>&1 && \
+      VLLM_VERSION="$VLLM_VERSION" TORCH_C_DLPACK_EXT_VERSION="$TORCH_C_DLPACK_EXT_VERSION" "$server_python" - <<'PY' >/dev/null 2>&1
+from importlib.metadata import version
+import os
+import paddle, torch, vllm
+from paddlex.inference.genai.models import is_integrated_model_available
+from paddlex.utils.deps import is_genai_engine_plugin_available
+assert vllm.__version__ == os.environ["VLLM_VERSION"]
+assert version("torch-c-dlpack-ext") == os.environ["TORCH_C_DLPACK_EXT_VERSION"]
+assert not paddle.is_compiled_with_cuda()
+assert torch.cuda.is_available()
+assert is_genai_engine_plugin_available("vllm-server")
+assert is_integrated_model_available("PaddleOCR-VL-1.6-0.9B", "vllm")
+PY
+    then
+      ok 'Project-local PaddleOCR-VL vLLM server dependencies, ccache, and NVIDIA runtime.'
+    else
+      warn 'Project-local PaddleOCR-VL vLLM server; run ./scripts/setup-vlm-server.sh.'
+    fi
   else
-    info 'NVIDIA GPU not detected; setup will configure CPU fallback.'
+    llama_server="$ROOT/.envs/ocr-llama-server/bin/llama-server"
+    model_dir="$DOWNLOAD_ROOT/paddleocr-vl-gguf"
+    if [[ -x "$llama_server" && -s "$model_dir/PaddleOCR-VL-1.6-GGUF.gguf" && -s "$model_dir/PaddleOCR-VL-1.6-GGUF-mmproj.gguf" ]] && \
+      echo "$OCR_GGUF_MODEL_SHA256  $model_dir/PaddleOCR-VL-1.6-GGUF.gguf" | sha256sum -c --status && \
+      echo "$OCR_GGUF_MMPROJ_SHA256  $model_dir/PaddleOCR-VL-1.6-GGUF-mmproj.gguf" | sha256sum -c --status; then
+      ok 'Project-local PaddleOCR-VL llama.cpp CPU service and verified GGUF models.'
+    else
+      warn 'Project-local PaddleOCR-VL llama.cpp CPU service; run ./scripts/setup-llama-server.sh.'
+    fi
   fi
   if (( missing_system_tools )); then
     info 'Use ./scripts/configure --setup to install required system utilities only if local alternatives are unavailable.'
@@ -116,6 +478,10 @@ if (( ! setup )); then
 fi
 
 if (( ! assume_yes )); then
+  if [[ "${CONFIGURE_ORIGINAL_STDIN_TTY:-1}" != 1 ]]; then
+    fail 'This operation needs confirmation in an interactive terminal; pass --yes to confirm explicitly.'
+    exit 2
+  fi
   printf 'Install or replace the project-local OCR environment? [y/N] '
   read -r answer
   case "$answer" in
@@ -123,6 +489,7 @@ if (( ! assume_yes )); then
     *) info 'Installation cancelled.'; exit 0 ;;
   esac
 fi
+info 'Press Ctrl+C to stop setup; any incomplete OCR environment will be removed.'
 
 ensure_system_installer_tools() {
   if { command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; } && \
@@ -183,14 +550,26 @@ ensure_system_installer_tools() {
 }
 
 ensure_system_installer_tools
-mkdir -p "$TOOLS" "$ENVS"
-source "$ROOT/environment/ocr-versions.env"
+mkdir -p "$TOOLS" "$ENVS" \
+  "$DOWNLOAD_ROOT/pip" "$DOWNLOAD_ROOT/conda" "$DOWNLOAD_ROOT/xdg" "$DOWNLOAD_ROOT/huggingface" \
+  "$DOWNLOAD_ROOT/paddlex" "$DOWNLOAD_ROOT/torch"
+export CONDA_PKGS_DIRS="$DOWNLOAD_ROOT/conda"
+export PIP_PROGRESS_BAR=on
+export DOWNLOAD_DIR="$DOWNLOAD_ROOT"
+export PIP_CACHE_DIR="$DOWNLOAD_ROOT/pip"
+export XDG_CACHE_HOME="$DOWNLOAD_ROOT/xdg"
+export HF_HOME="$DOWNLOAD_ROOT/huggingface"
+export HF_HUB_CACHE="$DOWNLOAD_ROOT/huggingface/hub"
+export PADDLE_PDX_CACHE_HOME="$DOWNLOAD_ROOT/paddlex"
+export TORCH_HOME="$DOWNLOAD_ROOT/torch"
 
 download_file() {
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$1" -o "$2"
+  if command -v wget >/dev/null 2>&1; then
+    info "Downloading $1"
+    wget -c --show-progress "$1" -O "$2"
   else
-    wget -q "$1" -O "$2"
+    info "Downloading $1"
+    curl -fL -C - --progress-bar "$1" -o "$2"
   fi
 }
 
@@ -202,69 +581,80 @@ sha256_file() {
   fi
 }
 
-if command -v micromamba >/dev/null 2>&1; then
-  MAMBA="$(command -v micromamba)"
-else
-  MAMBA="$TOOLS/micromamba"
-  if [[ ! -x "$MAMBA" ]]; then
-    release='https://github.com/mamba-org/micromamba-releases/releases/latest/download'
-    download_file "$release/micromamba-linux-64" "$TOOLS/micromamba.new"
-    download_file "$release/micromamba-linux-64.sha256" "$TOOLS/micromamba.sha256"
-    read -r expected _ < "$TOOLS/micromamba.sha256"
-    read -r actual _ < <(sha256_file "$TOOLS/micromamba.new")
-    if [[ "${expected,,}" != "${actual,,}" ]]; then
-      rm -f "$TOOLS/micromamba.new"
-      fail 'micromamba checksum verification failed.'
-      exit 1
-    fi
-    mv "$TOOLS/micromamba.new" "$MAMBA"
-    chmod 755 "$MAMBA"
-  fi
-fi
-export MAMBA_ROOT_PREFIX="$TOOLS/mamba-root"
-
-create_base() {
-  local prefix="$1"
-  "$MAMBA" create -y -p "$prefix" -c conda-forge "python=$PYTHON_VERSION" pip ffmpeg || return 1
-  "$MAMBA" run -p "$prefix" python -m pip install --upgrade pip || return 1
-  "$MAMBA" run -p "$prefix" python -m pip install -e "$ROOT" || return 1
-}
-
-gpu_ok=0
-if command -v nvidia-smi >/dev/null 2>&1; then
-  gpu_info="$(nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader 2>/dev/null | head -n1 || true)"
-  if [[ -n "$gpu_info" ]]; then
-    info "NVIDIA GPU detected: $gpu_info"
-    gpu_prefix="$ENVS/ocr-gpu"
-    rm -rf "$gpu_prefix"
-    if create_base "$gpu_prefix" && \
-      "$MAMBA" run -p "$gpu_prefix" python -m pip install "paddlepaddle-gpu==$PADDLE_VERSION" -i "$CUDA_INDEX_URL" && \
-      "$MAMBA" run -p "$gpu_prefix" python -m pip install "paddleocr[doc-parser]==$PADDLEOCR_VERSION" && \
-      "$MAMBA" run -p "$gpu_prefix" python -c 'import paddle; assert paddle.device.cuda.device_count() > 0' && \
-      "$MAMBA" run -p "$gpu_prefix" python -c 'from paddleocr import PaddleOCRVL; PaddleOCRVL(device="gpu:0")'; then
-      printf 'mode=gpu\nprefix=%q\n' "$gpu_prefix" > "$STATE"
-      gpu_ok=1
-      ok "Selected OCR environment: GPU ($gpu_prefix)"
-    else
-      warn 'GPU OCR setup or initialization failed; removing the GPU environment and falling back to CPU.'
-      rm -rf "$gpu_prefix"
-    fi
-  fi
-fi
-
-if [[ "$gpu_ok" -eq 0 ]]; then
-  cpu_prefix="$ENVS/ocr-cpu"
-  rm -rf "$cpu_prefix"
-  if ! create_base "$cpu_prefix" || \
-    ! "$MAMBA" run -p "$cpu_prefix" python -m pip install "paddlepaddle==$PADDLE_VERSION" -i "$CPU_INDEX_URL" || \
-    ! "$MAMBA" run -p "$cpu_prefix" python -m pip install "paddleocr[doc-parser]==$PADDLEOCR_VERSION" || \
-    ! "$MAMBA" run -p "$cpu_prefix" python -c 'import paddle, rapidocr; import video_subtitles.cli'; then
-    rm -rf "$cpu_prefix"
-    fail 'CPU OCR environment setup failed. See the package manager output above.'
+MINIFORGE_ROOT="$TOOLS/miniforge3"
+CONDA="$MINIFORGE_ROOT/bin/conda"
+if [[ ! -x "$CONDA" ]]; then
+  miniforge_mirror='https://mirrors.tuna.tsinghua.edu.cn/github-release/conda-forge/miniforge/LatestRelease'
+  installer_filename="Miniforge3-${MINIFORGE_VERSION}-Linux-x86_64.sh"
+  installer_url="$miniforge_mirror/$installer_filename"
+  checksum_url="$installer_url.sha256"
+  info 'Downloading the Miniforge installer (resumable with wget -c).'
+  download_file "$installer_url" "$MINIFORGE_INSTALLER"
+  download_file "$checksum_url" "$MINIFORGE_CHECKSUM"
+  info 'Verifying the Miniforge installer checksum.'
+  read -r expected _ < "$MINIFORGE_CHECKSUM"
+  read -r actual _ < <(sha256_file "$MINIFORGE_INSTALLER")
+  if [[ "${expected,,}" != "${actual,,}" ]]; then
+    rm -f -- "$MINIFORGE_INSTALLER" "$MINIFORGE_CHECKSUM"
+    fail 'Miniforge installer checksum verification failed; the downloaded files were removed.'
     exit 1
   fi
-  printf 'mode=cpu\nprefix=%q\n' "$cpu_prefix" > "$STATE"
-  ok "Selected OCR environment: CPU ($cpu_prefix)"
+  info "Installing project-local Miniforge at $MINIFORGE_ROOT."
+  rm -rf -- "$MINIFORGE_ROOT"
+  ACTIVE_ENV_PREFIX="$MINIFORGE_ROOT"
+  run_child_command "Installing Miniforge into $MINIFORGE_ROOT" 0 \
+    bash "$MINIFORGE_INSTALLER" -b -p "$MINIFORGE_ROOT" || {
+      rm -rf -- "$MINIFORGE_ROOT"
+      ACTIVE_ENV_PREFIX=""
+      fail 'Miniforge installation failed; the incomplete installation was removed.'
+      exit 1
+    }
+  if [[ ! -x "$CONDA" ]]; then
+    rm -rf -- "$MINIFORGE_ROOT"
+    ACTIVE_ENV_PREFIX=""
+    fail 'Miniforge installation did not create the conda executable.'
+    exit 1
+  fi
+  ACTIVE_ENV_PREFIX=""
+fi
+# Remove the project-managed legacy bootstrap after Miniforge is ready.
+rm -f -- "$TOOLS/micromamba" "$TOOLS/micromamba.new" "$TOOLS/micromamba.sha256"
+rm -rf -- "$TOOLS/mamba-root"
+create_base() {
+  local prefix="$1"
+  run_child_command "Creating project environment with Python $PYTHON_VERSION, pip, FFmpeg and FFprobe ($prefix)" 0 \
+    "$CONDA" create -y -p "$prefix" -c conda-forge "python=$PYTHON_VERSION" pip ffmpeg || return 1
+  run_child_command 'Upgrading pip in the project environment' 0 \
+    "$CONDA" run --no-capture-output -p "$prefix" python -m pip install --upgrade pip || return 1
+  run_child_command 'Installing application requirements (ASR, media and online-video packages)' 0 \
+    "$CONDA" run --no-capture-output -p "$prefix" python -m pip install -e "$ROOT" || return 1
+}
+
+rm -f -- "$STATE"
+client_prefix="$ENVS/ocr-client"
+ACTIVE_ENV_PREFIX="$client_prefix"
+rm -rf -- "$client_prefix"
+if ! create_base "$client_prefix" || \
+  ! run_child_command "Installing CPU PaddlePaddle $PADDLE_VERSION for client preprocessing" 0 "$CONDA" run --no-capture-output -p "$client_prefix" python -m pip install "paddlepaddle==$PADDLE_VERSION" -i "$CPU_INDEX_URL" || \
+  ! run_child_command "Installing PaddleOCR-VL $PADDLEOCR_VERSION client packages" 0 "$CONDA" run --no-capture-output -p "$client_prefix" python -m pip install "paddleocr[doc-parser]==$PADDLEOCR_VERSION" || \
+  ! run_child_command 'Checking PaddleOCR-VL client dependencies' 0 "$CONDA" run --no-capture-output -p "$client_prefix" python -c 'import paddle, video_subtitles.cli; assert not paddle.is_compiled_with_cuda(); from paddleocr import PaddleOCRVL'; then
+  rm -rf "$client_prefix"
+  ACTIVE_ENV_PREFIX=""
+  fail 'OCR client environment setup failed. See the package manager output above.'
+  exit 1
+fi
+if ! run_child_command 'Downloading the project-local CPU subtitle detector model' 0 \
+  "$CONDA" run --no-capture-output -p "$client_prefix" python -c 'from paddleocr import TextDetection; TextDetection(model_name="PP-OCRv5_mobile_det", device="cpu", limit_side_len=640, limit_type="max", enable_mkldnn=False)'; then
+  warn 'The optional CPU subtitle detector could not be downloaded; CPU OCR will retain the conservative 0.5-second cadence.'
+fi
+printf 'mode=client\nprefix=%q\n' "$client_prefix" > "$STATE"
+rm -rf -- "$ENVS/ocr-gpu" "$ENVS/ocr-cpu" "$ROOT/.venv-ocr-gpu" "$ROOT/.venv-ocr-cpu"
+ACTIVE_ENV_PREFIX=""
+ok "Selected PaddleOCR-VL client environment: CPU preprocessing ($client_prefix)"
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  info 'For GPU inference, run ./scripts/setup-vlm-server.sh, then ./scripts/vlm-server.sh start.'
+else
+  info 'For CPU inference, run ./scripts/setup-llama-server.sh, then ./scripts/llama-server.sh start.'
 fi
 
 ok "Environment selection saved to $STATE"
