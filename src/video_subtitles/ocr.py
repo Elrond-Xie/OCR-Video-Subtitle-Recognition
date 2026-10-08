@@ -283,6 +283,10 @@ def subtitle_from_frames(
         raise
     except Exception as exc:
         raise OCRProcessingError(f"OCR failed while processing video frames: {exc}") from exc
+    finally:
+        close_frames = getattr(frames, "close", None)
+        if close_frames is not None:
+            close_frames()
 
     if on_progress is not None and duration is not None and next_progress < duration:
         on_progress(duration, duration)
