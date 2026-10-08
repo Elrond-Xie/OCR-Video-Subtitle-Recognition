@@ -193,22 +193,24 @@ def create_ocr_runtime(resources=None, on_model_load=None, on_fallback=None):
     plan = plan_ocr_resources(system, cuda_ready)
     if on_model_load is not None:
         on_model_load()
-    rapid = create_rapid_engine(plan.cpu_threads)
     if plan.engine == "rapidocr":
-        return rapid, plan
+        return create_rapid_engine(plan.cpu_threads), plan
     if sys.platform == "darwin":
-        return rapid, _rapid_plan(plan)
+        plan = _rapid_plan(plan)
+        return create_rapid_engine(plan.cpu_threads), plan
     try:
         import importlib.util
 
         if importlib.util.find_spec("paddleocr") is None:
             if on_fallback is not None:
                 on_fallback("PaddleOCR is not installed in this Python environment")
-            return rapid, _rapid_plan(plan)
+            plan = _rapid_plan(plan)
+            return create_rapid_engine(plan.cpu_threads), plan
     except (ImportError, ValueError):
         if on_fallback is not None:
             on_fallback("PaddleOCR is not installed in this Python environment")
-        return rapid, _rapid_plan(plan)
+        plan = _rapid_plan(plan)
+        return create_rapid_engine(plan.cpu_threads), plan
     try:
         vl_device = f"gpu:{plan.device_id or 0}" if plan.device == "cuda" else "cpu"
         vl = create_paddle_vl_engine(vl_device, plan.cpu_threads, plan.batch_size)
@@ -224,7 +226,8 @@ def create_ocr_runtime(resources=None, on_model_load=None, on_fallback=None):
         if on_fallback is not None:
             on_fallback(str(exc))
         plan = _rapid_plan(plan)
-        return rapid, plan
+        return create_rapid_engine(plan.cpu_threads), plan
+    rapid = create_rapid_engine(plan.cpu_threads)
     return FallbackOCREngine(vl, rapid, on_fallback), plan
 
 

@@ -202,7 +202,8 @@ def _nvidia_free_memory() -> tuple[int | None, int | None]:
 
 def _read_text(path: str) -> str | None:
     try:
-        return open(path, encoding="ascii").read().strip()
+        with open(path, encoding="ascii") as source:
+            return source.read().strip()
     except OSError:
         return None
 
