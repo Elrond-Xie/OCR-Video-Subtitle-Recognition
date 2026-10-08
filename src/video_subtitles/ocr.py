@@ -80,7 +80,13 @@ class PaddleOCRVLEngine:
             from paddleocr import PaddleOCRVL
         except ImportError as exc:
             raise DependencyError("PaddleOCR-VL is missing. Run the platform setup script to install the VL runtime.") from exc
-        kwargs: dict[str, Any] = {"device": device if device.startswith("gpu:") else "cpu"}
+        if device.startswith("gpu:"):
+            paddle_device = device
+        elif device == "cuda":
+            paddle_device = "gpu:0"
+        else:
+            paddle_device = "cpu"
+        kwargs: dict[str, Any] = {"device": paddle_device}
         if device == "cpu":
             kwargs["cpu_threads"] = max(1, cpu_threads)
         try:
@@ -108,7 +114,7 @@ class PaddleOCRVLEngine:
     def _predict(self, images: Sequence[Any]) -> list[Any]:
         output: list[Any] = []
         # PaddleOCR-VL exposes predict_iter for streamed, memory-bounded inference.
-        iterator = self._engine.predict_iter(list(images), prompt_label="ocr")
+        iterator = self._engine.predict_iter(list(images))
         for result in iterator:
             output.append(result)
         if len(output) != len(images):
@@ -336,9 +342,12 @@ def _paddle_result(result: Any) -> list[OCRText]:
         if not isinstance(text, str) or not text.strip():
             continue
         label = str(block.get("block_label") or "").lower()
-        if label and label not in {"text", "title", "paragraph", "caption", "list"}:
+        if label in {"image", "table", "figure", "formula", "chart", "seal"}:
             continue
-        box = _normalize_box(block.get("block_bbox") or block.get("bbox"))
+        raw_box = block.get("block_bbox")
+        if raw_box is None:
+            raw_box = block.get("bbox")
+        box = _normalize_box(raw_box)
         output.append(OCRText(text, box, None))
     return output
 
