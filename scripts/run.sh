@@ -5,11 +5,25 @@ STATE="$ROOT/.ocr-environment"
 usage() {
   echo 'Usage: scripts/run.sh --input PATH_OR_URL [--ocr] [--output FILE] [other subtitles options]' >&2
 }
+for argument in "$@"; do
+  if [[ "$argument" == --help || "$argument" == -h ]]; then
+    cat <<'USAGE'
+Usage: scripts/run.sh --input PATH_OR_URL [OPTIONS]
+
+Examples:
+  scripts/run.sh --input ./video.mp4 --ocr
+  scripts/run.sh --input "https://example.com/video" --cookies ./cookies.txt --ocr
+
+Options are forwarded to the subtitles CLI, including --output, --cookies,
+--model, --force, and --ocr.
+USAGE
+    exit 0
+  fi
+done
 has_input=0
 for argument in "$@"; do
   case "$argument" in
     --input|--input=*) has_input=1 ;;
-    --help|-h) has_input=1 ;;
   esac
 done
 if (( ! has_input )); then
