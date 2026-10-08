@@ -17,7 +17,8 @@ Add an opt-in OCR mode to the `subtitles` CLI for extracting text that is visibl
 1. When `--ocr` is absent, preserve the existing extraction pipeline.
 2. When `--ocr` is present, prepare the video frames:
    - For a local input, read frames from the local video.
-   - For an online URL, use yt-dlp to download the video into the existing temporary work directory, passing cookies only if the user supplied `--cookies`.
+   - For an online URL, use yt-dlp to retrieve the video, passing cookies only if the user supplied `--cookies`. Prefer piping a compatible video stream into frame decoding; use a temporary video file when the selected format or decoder requires it.
+   - If yt-dlp cannot retrieve the video, stop with an actionable error telling the user to save the video through an available method and rerun the command with that local file. Do not silently switch to ASR or a mismatching subtitle track because no image frames were available for OCR.
 3. Sample approximately two frames per second and run local OCR on each sampled frame. Process the full frame, then prefer stable text detections in the lower portion of the image, where dialogue captions are normally placed.
 4. Normalize recognized lines, suppress low-confidence or isolated detections, merge consecutive repeated text, and infer cue boundaries from the sample times.
 5. Convert the resulting cues to SRT and write them using the existing output and `--force` behavior.
@@ -30,7 +31,7 @@ Add an opt-in OCR mode to the `subtitles` CLI for extracting text that is visibl
 - `src/video_subtitles/pipeline.py`: route `--ocr` inputs through OCR before any subtitle-track or ASR processing.
 - `src/video_subtitles/ocr.py`: sample frames, run OCR, filter and merge detections, and serialize cues through the existing SRT helpers.
 - `src/video_subtitles/media.py`: expose a frame-reading helper for local inputs using the existing FFmpeg media dependency.
-- `src/video_subtitles/online.py`: download video to the temporary directory for OCR mode, preserving yt-dlp support and explicit cookie handling.
+- `src/video_subtitles/online.py`: retrieve video frames through yt-dlp stream or temporary-file handling for OCR mode, preserving supported-site behavior and explicit cookie handling.
 - `pyproject.toml`: add RapidOCR with CPU ONNX Runtime support.
 - `README.md`: document `--ocr`, local model behavior, online video download/storage cost, and estimated timestamp precision.
 
@@ -56,7 +57,9 @@ subtitles <input> [--output PATH] [--cookies FILE] [--model MODEL] [--ocr] [--fo
 
 ## Boundaries and errors
 
-- Online OCR requires downloading video rather than audio only. Temporary video files are removed after processing; bandwidth and disk use can be substantial.
+- Online OCR must retrieve video frames rather than audio only. Temporary video files are removed after processing; bandwidth and disk use can be substantial.
+- Streaming frames can avoid storing a complete video when the selected format and decoder support it, but it does not bypass yt-dlp site support, authentication, access restrictions, or DRM. Some formats still require a temporary file.
+- Browser playback capture is not part of this CLI version. If yt-dlp cannot retrieve the video, the user must supply a local video file obtained through a method available to them.
 - OCR is CPU-capable and local, but may be slower than subtitle-track extraction. The first use may need to obtain OCR model files.
 - Accuracy depends on caption font, contrast, animation, screen position, and frame sampling. OCR does not guarantee exact text or frame-perfect timing.
 - If the video has no visible dialogue captions or OCR cannot produce usable cues, the command falls back to the existing local ASR behavior.
@@ -66,7 +69,9 @@ subtitles <input> [--output PATH] [--cookies FILE] [--model MODEL] [--ocr] [--fo
 
 - `subtitles INPUT --ocr` attempts OCR even when an online subtitle track exists.
 - Local video OCR produces SRT cues from captions burned into video frames without uploading media.
-- Online OCR uses yt-dlp to retrieve video, honors an explicitly supplied cookie file, and does not download a video when `--ocr` is absent.
+- Online OCR uses yt-dlp to retrieve video, honors an explicitly supplied cookie file, and does not retrieve video when `--ocr` is absent.
+- When compatible, online OCR processes a stream without keeping a complete video file; any temporary video file is cleaned up.
+- When yt-dlp cannot retrieve online video, the command reports the limitation and suggests retrying with a user-provided local file instead of silently using another text source.
 - Repeated visible captions are merged into timed cues and transient non-caption text is filtered where possible.
 - If OCR finds no usable captions, local ASR is used; if OCR succeeds, ASR is not loaded.
 - Output paths, overwrite protection, and temporary-file cleanup follow existing CLI behavior.
