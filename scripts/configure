@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE="$ROOT/.ocr-environment"
 TOOLS="$ROOT/.tools"
 ENVS="$ROOT/.envs"
@@ -42,9 +42,9 @@ for argument in "$@"; do
     --help|-h)
       cat <<'USAGE'
 Usage:
-  ./configure                 Check dependencies and environment status
-  ./configure --setup         Install the project OCR environment
-  ./configure --setup --yes   Install without confirmation prompts
+  ./scripts/configure                 Check dependencies and environment status
+  ./scripts/configure --setup         Install the project OCR environment
+  ./scripts/configure --setup --yes   Install without confirmation prompts
 USAGE
       exit 0
       ;;
@@ -95,13 +95,13 @@ if (( ! setup )); then
       if "$MAMBA" run -p "$prefix" python -c 'import av, faster_whisper, onnxruntime, psutil, rapidocr, yt_dlp; import paddle; from paddleocr import PaddleOCRVL; import shutil; assert shutil.which("ffmpeg") and shutil.which("ffprobe")' >/dev/null 2>&1; then
         ok 'Application, RapidOCR, Paddle, and PaddleOCR-VL Python dependencies import successfully.'
       else
-        warn 'One or more Python dependencies are missing or cannot import; run ./configure --setup.'
+        warn 'One or more Python dependencies are missing or cannot import; run ./scripts/configure --setup.'
       fi
     else
-      warn 'The saved OCR environment directory is missing; run ./configure --setup.'
+      warn 'The saved OCR environment directory is missing; run ./scripts/configure --setup.'
     fi
   else
-    warn 'No OCR environment is configured; run ./configure --setup.'
+    warn 'No OCR environment is configured; run ./scripts/configure --setup.'
   fi
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     ok "NVIDIA GPU detected: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)"
@@ -109,9 +109,9 @@ if (( ! setup )); then
     info 'NVIDIA GPU not detected; setup will configure CPU fallback.'
   fi
   if (( missing_system_tools )); then
-    info 'Use ./configure --setup to install required system utilities only if local alternatives are unavailable.'
+    info 'Use ./scripts/configure --setup to install required system utilities only if local alternatives are unavailable.'
   fi
-  info 'Dependency check complete. Use ./configure --setup [--yes] to install the OCR environment.'
+  info 'Dependency check complete. Use ./scripts/configure --setup [--yes] to install the OCR environment.'
   exit 0
 fi
 
@@ -130,7 +130,7 @@ ensure_system_installer_tools() {
     return 0
   fi
   if (( EUID != 0 )) && ! command -v sudo >/dev/null 2>&1; then
-    fail 'curl/coreutils are missing and sudo is unavailable. Install these system packages, then rerun ./configure --setup.'
+    fail 'curl/coreutils are missing and sudo is unavailable. Install these system packages, then rerun ./scripts/configure --setup.'
     return 1
   fi
   if command -v apt-get >/dev/null 2>&1; then
@@ -138,7 +138,7 @@ ensure_system_installer_tools() {
       apt-get update && apt-get install -y curl coreutils
     elif (( assume_yes )); then
       sudo -n apt-get update && sudo -n apt-get install -y curl coreutils || {
-        fail 'System tools need administrator access. Run ./configure --setup interactively or install curl and coreutils first.'
+        fail 'System tools need administrator access. Run ./scripts/configure --setup interactively or install curl and coreutils first.'
         return 1
       }
     else

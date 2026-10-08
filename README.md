@@ -18,17 +18,17 @@ Linux x86_64 推荐使用下面的 `configure`，它会在项目环境中安装 
 
 ### 自适应 OCR 环境（推荐）
 
-Linux 的 `./configure` 默认只检查环境，不安装软件。检测依赖时会根据当前 TTY 和终端能力显示颜色。只有缺少系统级下载或校验工具时才会用 `sudo` 安装它们；micromamba、Python 环境、FFmpeg 和 OCR 包都安装在项目目录，不需要管理员权限。
+Linux 的 `./scripts/configure` 默认只检查环境，不安装软件。检测依赖时会根据当前 TTY 和终端能力显示颜色。只有缺少系统级下载或校验工具时才会用 `sudo` 安装它们；micromamba、Python 环境、FFmpeg 和 OCR 包都安装在项目目录，不需要管理员权限。
 
 ```bash
-./configure
-./configure --setup
+./scripts/configure
+./scripts/configure --setup
 ```
 
 `--setup` 会检查 NVIDIA GPU 并尝试配置 CUDA；GPU 环境安装、运行时检查或 PaddleOCR-VL 初始化失败时，会清理该环境并新建 CPU 环境。添加 `--yes` 可跳过安装确认；如果自动安装缺少的系统工具需要 sudo，脚本使用非交互 sudo，要求当前 sudo 凭证已可用：
 
 ```bash
-./configure --setup --yes
+./scripts/configure --setup --yes
 ```
 
 Windows PowerShell 使用独立 Python 虚拟环境，GPU 安装失败时同样创建全新的 CPU 环境：

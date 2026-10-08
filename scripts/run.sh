@@ -31,7 +31,7 @@ if (( ! has_input )); then
   exit 2
 fi
 if [[ ! -f "$STATE" ]]; then
-  echo "OCR environment is not configured. Run: ./configure --setup" >&2
+  echo "OCR environment is not configured. Run: ./scripts/configure --setup" >&2
   exit 2
 fi
 source "$ROOT/environment/ocr-versions.env"
@@ -42,7 +42,7 @@ else
   MAMBA="$ROOT/.tools/micromamba"
 fi
 if [[ ! -x "$MAMBA" ]]; then
-  echo "micromamba is missing; rerun ./configure --setup" >&2
+  echo "micromamba is missing; rerun ./scripts/configure --setup" >&2
   exit 2
 fi
 export MAMBA_ROOT_PREFIX="$ROOT/.tools/mamba-root"
